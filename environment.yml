@@ -4,9 +4,14 @@ channels:
   - https://repo.prefix.dev/conda-forge
 dependencies:
   - xeus-python
-  - ipycanvas
+  - xeus-cpp
   - numpy
   - scipy
   - matplotlib
   - autograd
   - tqdm
+  - scikit-learn
+  - ipywidgets
+  - joblib
+  - setuptools
+
