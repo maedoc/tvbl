@@ -4,7 +4,6 @@ channels:
   - https://repo.prefix.dev/conda-forge
 dependencies:
   - xeus-python
-  - xeus-cpp
   - numpy
   - scipy
   - matplotlib
@@ -14,4 +13,4 @@ dependencies:
   - ipywidgets
   - joblib
   - setuptools
-
+  - jupyterlite-terminal

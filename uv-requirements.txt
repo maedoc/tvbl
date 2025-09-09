@@ -1,0 +1,1 @@
+jupyterlab matplotlib scipy autograd tqdm joblib scikit_learn ipywidgets

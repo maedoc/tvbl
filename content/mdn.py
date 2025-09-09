@@ -154,8 +154,107 @@ def train_mdn(theta, feats, K=5, H=(32, 32), niter=2000, learning_rate=1e-3):
     # Return the forward_pass function as a closure for easy prediction
     return weights, loss_history, forward_pass
 
+def sample(trained_weights, predictor_func, x_input, n_samples=1):
+    """
+    Generates samples from the posterior distribution p(y|x) learned by the MDN.
 
-def test_mdn():
+    Args:
+        trained_weights (dict): The dictionary of trained network weights.
+        predictor_func (function): The forward_pass function from the trained MDN.
+        x_input (np.ndarray): An array of input features (conditions) of shape (N_cond, D_in).
+                              If a single condition is given, it can be shape (D_in,).
+        n_samples (int): The number of samples to generate for each input condition.
+
+    Returns:
+        np.ndarray: An array of generated samples of shape (N_cond, n_samples, D_out).
+                    If the input was 1D, the output shape is squeezed to (n_samples, D_out).
+    """
+    import autograd.numpy as np
+
+    # --- 1. Input validation and reshaping ---
+    was_1d = False
+    if x_input.ndim == 1:
+        x_input = x_input.reshape(1, -1)
+        was_1d = True
+
+    # Ensure input is float32, consistent with training
+    x_input = x_input.astype('f')
+
+    # --- 2. Get GMM parameters from the network ---
+    alpha, mu, L_prec, _ = predictor_func(trained_weights, x_input)
+    # alpha: (N_cond, K)
+    # mu: (N_cond, K, D_out)
+    # L_prec: (N_cond, K, D_out, D_out)
+    N_cond, K, D_out = mu.shape
+
+    # --- 3. Select mixture components for each sample ---
+    # We use the Gumbel-Max trick for efficient, vectorized sampling from the
+    # categorical distribution defined by the mixing coefficients (alpha).
+    log_alpha = np.log(alpha + 1e-9) # Add epsilon for numerical stability
+
+    # Gumbel noise, broadcastable to (N_cond, n_samples, K)
+    gumbel_noise = -np.log(-np.log(np.random.uniform(size=(N_cond, n_samples, K))))
+
+    # Select component indices by finding the argmax
+    component_indices = np.argmax(log_alpha[:, np.newaxis, :] + gumbel_noise, axis=2)
+    # component_indices has shape (N_cond, n_samples)
+
+    # --- 4. Gather the parameters (mu, L_prec) for the chosen components ---
+    # Use advanced indexing for an efficient, vectorized lookup.
+    cond_idx = np.arange(N_cond)[:, np.newaxis] # Shape (N_cond, 1) for broadcasting
+
+    chosen_mu = mu[cond_idx, component_indices]
+    # -> shape (N_cond, n_samples, D_out)
+
+    chosen_L_prec = L_prec[cond_idx, component_indices]
+    # -> shape (N_cond, n_samples, D_out, D_out)
+
+    # --- 5. Sample from the selected multivariate Gaussian components ---
+    # As derived above, we need the inverse of L_prec.
+    try:
+        L_cov_factor = np.linalg.inv(chosen_L_prec)
+    except np.linalg.LinAlgError as e:
+        print("Error: Failed to invert the Cholesky factor of the precision matrix.")
+        print("This can happen if a component's precision matrix is singular or ill-conditioned.")
+        raise e
+
+    # Generate standard normal random vectors
+    z = np.random.randn(N_cond, n_samples, D_out)
+
+    # Transform the standard normal samples to the target distribution: y = mu + L_cov_factor @ z
+    samples = chosen_mu + np.einsum('nsij,nsj->nsi', L_cov_factor, z)
+    # samples has shape (N_cond, n_samples, D_out)
+
+    # --- 6. Squeeze output if input was 1D for convenience ---
+    if was_1d:
+        return samples.squeeze(axis=0)
+
+    return samples
+
+
+def plot_ellipse(mean, cov, color, label, std_devs=1.0):
+    """
+    Plots a covariance ellipse on a given matplotlib axes instance.
+    """
+    import matplotlib.pyplot as pl
+    from matplotlib.patches import Ellipse
+    # Eigenvalue decomposition to find the axes of the ellipse
+    eigenvalues, eigenvectors = np.linalg.eigh(cov)
+
+    # Get the angle of the major axis
+    angle = np.degrees(np.arctan2(*eigenvectors[:, 0][::-1]))
+
+    # Get the width and height of the ellipse (major and minor axes)
+    # The eigenvalues are the variances, so the std dev is the sqrt
+    width, height = 2 * std_devs * np.sqrt(eigenvalues)
+
+    ellipse = Ellipse(xy=mean, width=width, height=height, angle=angle,
+                      edgecolor=color, facecolor='none', linewidth=2,
+                      label=label)
+    pl.gca().add_patch(ellipse)
+
+
+def test_mdn(plot=False):
     # Generate some synthetic data for a clear demonstration.
     # The goal is to learn a bimodal distribution where the features determine the mode.
     N_samples = 4000
@@ -183,8 +282,8 @@ def test_mdn():
         sim_feats, 
         K=2,            # We know there are 2 modes in this toy problem
         H=(24, 24),     # A small MLP
-        niter=1200,
-        learning_rate=3e-3
+        niter=400,
+        learning_rate=5e-3
     )
 
     print(f"\nFinal loss: {losses[-1]:.4f}")
@@ -219,6 +318,31 @@ def test_mdn():
     else:
         print("\nFailure: The network did not correctly identify the modes.")
 
+    if plot:    
+        # Define two test features to elicit the two different posterior modes
+        test_feat_pos = np.array([[1.5]], dtype='f')  # Should trigger mode 1
+        test_feat_neg = np.array([[-1.5]], dtype='f') # Should trigger mode 2
+        n_plot_samples = 1000
+        
+        print("Generating samples for positive feature...")
+        samples_pos = sample(trained_weights, predictor_func, test_feat_pos, n_samples=n_plot_samples)
+        
+        print("Generating samples for negative feature...")
+        samples_neg = sample(trained_weights, predictor_func, test_feat_neg, n_samples=n_plot_samples)
+
+        import matplotlib.pyplot as pl
+        
+        pl.plot(samples_neg[0,:,0], samples_neg[0,:,1], ',b')
+        pl.plot(samples_pos[0,:,0], samples_pos[0,:,1], ',g')
+        
+        pl.plot(mean1[0], mean1[1], 'x', color='black', markersize=12, mew=3, label='True Mean 1')
+        pl.plot(mean2[0], mean2[1], '+', color='black', markersize=12, mew=3, label='True Mean 2')
+        
+        # Plot the 1-standard deviation ellipses for the true distributions
+        plot_ellipse(mean1, cov1, color='royalblue', label='1-std dev (True Dist. 1)')
+        plot_ellipse(mean2, cov2, color='firebrick', label='1-std dev (True Dist. 2)')
+        
+        pl.show()
 
 if __name__ == "__main__":
     test_mdn()
