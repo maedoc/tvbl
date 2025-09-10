@@ -14,5 +14,8 @@ dependencies:
   - joblib
   - setuptools
   - jupyterlite-terminal
-  - mne
-  - ebrains-drive
+  - pip
+  - pip:
+    - mne
+    - ebrains-drive
+    - pyunicore
