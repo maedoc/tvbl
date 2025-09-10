@@ -14,6 +14,7 @@ dependencies:
   - joblib
   - setuptools
   - jupyterlite-terminal
+  - catppuccin-jupyterlab
   - pip
   - pip:
     - mne
