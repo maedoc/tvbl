@@ -32,6 +32,7 @@ jobs:
         run: |
           cp README.md content
           jupyter lite build --contents content --output-dir dist
+          cp -rv dist/extensions/catppuccin_jupyterlab/themes/catppuccin_jupyterlab dist/build/themes/
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
