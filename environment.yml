@@ -14,3 +14,5 @@ dependencies:
   - joblib
   - setuptools
   - jupyterlite-terminal
+  - mne
+  - ebrains-drive
