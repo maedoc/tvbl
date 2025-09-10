@@ -19,3 +19,4 @@ dependencies:
     - mne
     - ebrains-drive
     - pyunicore
+    - tslearn
