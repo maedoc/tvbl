@@ -1,3 +1,4 @@
+import tqdm
 import autograd.numpy as np
 from autograd import grad
 from autograd.scipy.special import logsumexp
@@ -136,7 +137,7 @@ def train_mdn(theta, feats, K=5, H=(32, 32), niter=2000, learning_rate=1e-3):
         loss = neg_log_likelihood(weights, feats, theta)
         loss_history.append(loss)
         
-        if (i + 1) % 200 == 0 or i == 0:
+        if (i + 1) % 100 == 0 or i == 0:
             print(f"Iteration {i+1:5d}/{niter}, Loss: {loss:.4f}")
 
         # Adam update step
