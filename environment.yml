@@ -22,3 +22,4 @@ dependencies:
     - pyunicore
     - tslearn
     - catppuccin-jupyterlab
+    - corner
