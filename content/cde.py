@@ -11,7 +11,6 @@ from dataclasses import dataclass, field
 import autograd.numpy as anp
 from autograd import grad
 from autograd.scipy.special import logsumexp
-from sklearn.datasets import make_moons
 from scipy.stats import t
 from tqdm.auto import trange
 
@@ -525,6 +524,7 @@ def generate_test_data(dataset_name: str, n_samples: int, seed: int = 42):
             params[i, :] = t.rvs(df, size=2, random_state=rng)
 
     elif dataset_name == 'moons':
+        from sklearn.datasets import make_moons
         # Feature controls the noise level
         features[:, 0] = rng.uniform(0.05, 0.2, size=n_samples)
         for i in range(n_samples):
