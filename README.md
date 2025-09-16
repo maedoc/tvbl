@@ -4,7 +4,7 @@
 ## Build locally
 
 ```sh
- micromamba create -f build-environment.yml -n build-tvbl
+micromamba create -f build-environment.yml -n build-tvbl
 micromamba activate build-tvbl
 jupyter lite build --contents content
 ```

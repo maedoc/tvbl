@@ -4,7 +4,7 @@ import scipy.sparse
 import tqdm
 from dataclasses import dataclass
 
-def _cfun(t, buffer, csr_weights, idelays2, horizon):
+def cfun(t, buffer, csr_weights, idelays2, horizon):
     cx = buffer[csr_weights.indices, (t-idelays2) % horizon]
     cx *= csr_weights.data.reshape(-1, 1)
     cx = np.add.reduceat(cx, csr_weights.indptr[:-1], axis=1)
@@ -23,9 +23,12 @@ class DFun:
         ])  # (2, num_node, num_item)
 
 
-def _heun(x, cx, dt, num_node, num_item, dfun, z_scale):
-    z = np.random.randn(2, num_node, num_item)
-    z *= z_scale.reshape((2, 1, -1))
+def heun(x, cx, dt, num_node, num_item, dfun, z_scale):
+    if isinstance(z_scale, (int, float)) and z_scale == 0:
+        z = 0
+    else:
+        z = np.random.randn(2, num_node, num_item)
+        z *= z_scale.reshape((2, 1, -1))
     dx1 = dfun(x, cx[0])
     dx2 = dfun(x + dt*dx1 + z, cx[1])
     return x + dt/2*(dx1 + dx2) + z
@@ -55,8 +58,8 @@ def run(
     for t in steps:
         for tt in range(num_skip):
             ttt = t*num_skip + tt
-            cx = _cfun(ttt, buffer, csr_weights, idelays2, horizon)
-            x = _heun(x, cx, dt, num_node, num_item, dfun, z_scale)
+            cx = cfun(ttt, buffer, csr_weights, idelays2, horizon)
+            x = heun(x, cx, dt, num_node, num_item, dfun, z_scale)
             buffer[:, ttt % horizon] = x[0]
         trace[t] = x
         

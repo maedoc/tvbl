@@ -15,6 +15,7 @@ dependencies:
   - joblib
   - setuptools
   - jupyterlite-terminal
+  - pandas
   - pip
   - pip:
     - mne
@@ -23,3 +24,4 @@ dependencies:
     - tslearn
     - catppuccin-jupyterlab
     - corner
+    - pooch
