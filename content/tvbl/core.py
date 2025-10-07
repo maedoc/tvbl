@@ -11,6 +11,27 @@ def cfun(t, buffer, csr_weights, idelays2, horizon):
     return cx  # (2, num_node, num_item)
 
 
+try:
+    import pyjs
+    _js_cfun = pyjs.js.Function("cx", "t", "buffer", "indices", "weights", "indptr", "idelays2", "horizon", """
+    """)
+    _np_cfun = cfun
+    def cfun(t, buffer, csr_weights, idelays2, horizon, validate=True):
+        cx_np = _np_cfun(t, buffer, csr_weights, idelays2, horizon)
+        cx = np.zeros(cx_np.shape, 'f')
+        j_cx = pyjs.buffer_to_js_typed_array(cx, view=True)
+        j_buffer = pyjs.buffer_to_js_typed_array(buffer, view=True)
+        j_indices = pyjs.buffer_to_js_typed_array(csr_weights.indices, view=True)
+        j_weights = pyjs.buffer_to_js_typed_array(csr_weights.data, view=True)
+        j_indptr = pyjs.buffer_to_js_typed_array(csr_weights.indptr, view=True)
+        j_idelays2 = pyjs.buffer_to_js_typed_array(idelays2, view=True)
+        _js_cfun(j_cx, t, j_buffer, j_indices, j_weights, j_indptr, j_idelays2, horizon)
+        assert np.allclose(cx, cx_np, atol=1e-5)
+        return cx
+except ImportError:
+    print("pyjs not found, using pure python implementation")
+
+
 @dataclass
 class DFun:
     sim_params: np.ndarray
