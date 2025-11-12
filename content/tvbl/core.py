@@ -39,15 +39,27 @@ try:
                 const src_node = indices[i];
                 const weight = weights[i];
                 
-                // Get two neighboring time points (d=0 and d=1)
-                for (let d = 0; d < 2; d++) {
-                    const delay = idelays2[d * indices.length + i];
+                // Get two neighboring time points (d=0 and d=1) - unrolled for performance
+                // d=0
+                {
+                    const delay = idelays2[i];
                     const time_idx = ((t - delay) % horizon + horizon) % horizon;
                     
-                    // Accumulate weighted buffer values for all items
                     for (let item = 0; item < num_item; item++) {
                         const buffer_idx = src_node * horizon * num_item + time_idx * num_item + item;
-                        const cx_idx = d * num_node * num_item + node * num_item + item;
+                        const cx_idx = node * num_item + item;
+                        cx[cx_idx] += buffer[buffer_idx] * weight;
+                    }
+                }
+                
+                // d=1
+                {
+                    const delay = idelays2[indices.length + i];
+                    const time_idx = ((t - delay) % horizon + horizon) % horizon;
+                    
+                    for (let item = 0; item < num_item; item++) {
+                        const buffer_idx = src_node * horizon * num_item + time_idx * num_item + item;
+                        const cx_idx = num_node * num_item + node * num_item + item;
                         cx[cx_idx] += buffer[buffer_idx] * weight;
                     }
                 }
