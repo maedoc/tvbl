@@ -14,6 +14,57 @@ def cfun(t, buffer, csr_weights, idelays2, horizon):
 try:
     import pyjs
     _js_cfun = pyjs.js.Function("cx", "t", "buffer", "indices", "weights", "indptr", "idelays2", "horizon", """
+        // cx is output buffer with shape (2, num_node, num_item)
+        // buffer has shape (num_node, horizon, num_item)
+        // indices, weights have shape (nnz,)
+        // indptr has shape (num_node + 1,)
+        // idelays2 has shape (2, nnz) - two neighboring time points per connection
+        
+        const num_node = indptr.length - 1;
+        const num_item = cx.length / (2 * num_node);
+        
+        // Initialize cx to zero
+        for (let i = 0; i < cx.length; i++) {
+            cx[i] = 0.0;
+        }
+        
+        // Single-pass CSR-style iteration
+        // For each target node, iterate through its incoming connections
+        for (let node = 0; node < num_node; node++) {
+            const start = indptr[node];
+            const end = indptr[node + 1];
+            
+            // For each incoming connection to this node
+            for (let i = start; i < end; i++) {
+                const src_node = indices[i];
+                const weight = weights[i];
+                
+                // Get two neighboring time points (d=0 and d=1) - unrolled for performance
+                // d=0
+                {
+                    const delay = idelays2[i];
+                    const time_idx = ((t - delay) % horizon + horizon) % horizon;
+                    
+                    for (let item = 0; item < num_item; item++) {
+                        const buffer_idx = src_node * horizon * num_item + time_idx * num_item + item;
+                        const cx_idx = node * num_item + item;
+                        cx[cx_idx] += buffer[buffer_idx] * weight;
+                    }
+                }
+                
+                // d=1
+                {
+                    const delay = idelays2[indices.length + i];
+                    const time_idx = ((t - delay) % horizon + horizon) % horizon;
+                    
+                    for (let item = 0; item < num_item; item++) {
+                        const buffer_idx = src_node * horizon * num_item + time_idx * num_item + item;
+                        const cx_idx = num_node * num_item + node * num_item + item;
+                        cx[cx_idx] += buffer[buffer_idx] * weight;
+                    }
+                }
+            }
+        }
     """)
     _np_cfun = cfun
     def cfun(t, buffer, csr_weights, idelays2, horizon, validate=True):
