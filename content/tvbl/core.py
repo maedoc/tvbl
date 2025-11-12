@@ -14,6 +14,63 @@ def cfun(t, buffer, csr_weights, idelays2, horizon):
 try:
     import pyjs
     _js_cfun = pyjs.js.Function("cx", "t", "buffer", "indices", "weights", "indptr", "idelays2", "horizon", """
+        // cx is output buffer with shape (2, num_node, num_item)
+        // buffer has shape (num_node, horizon, num_item)
+        // indices, weights have shape (nnz,)
+        // indptr has shape (num_node + 1,)
+        // idelays2 has shape (2, nnz)
+        
+        const nnz = indices.length;
+        const num_node = indptr.length - 1;
+        
+        // Get dimensions from cx output shape
+        // cx is flattened array of shape (2, num_node, num_item)
+        const num_item = cx.length / (2 * num_node);
+        
+        // Step 1: Get delayed values from buffer and multiply by weights
+        // temp will store weighted delayed values with shape (2, nnz, num_item)
+        const temp = new Float32Array(2 * nnz * num_item);
+        
+        for (let i = 0; i < nnz; i++) {
+            const node_idx = indices[i];
+            const weight = weights[i];
+            
+            for (let d = 0; d < 2; d++) {
+                const delay = idelays2[d * nnz + i];
+                const time_idx = ((t - delay) % horizon + horizon) % horizon;  // Handle negative modulo
+                
+                for (let item = 0; item < num_item; item++) {
+                    // buffer[node_idx, time_idx, item]
+                    const buffer_idx = node_idx * horizon * num_item + time_idx * num_item + item;
+                    const val = buffer[buffer_idx] * weight;
+                    
+                    // temp[d, i, item]
+                    const temp_idx = d * nnz * num_item + i * num_item + item;
+                    temp[temp_idx] = val;
+                }
+            }
+        }
+        
+        // Step 2: Sum groups using indptr (like np.add.reduceat)
+        // Result: cx with shape (2, num_node, num_item)
+        for (let d = 0; d < 2; d++) {
+            for (let node = 0; node < num_node; node++) {
+                const start = indptr[node];
+                const end = indptr[node + 1];
+                
+                for (let item = 0; item < num_item; item++) {
+                    let sum = 0.0;
+                    for (let i = start; i < end; i++) {
+                        // temp[d, i, item]
+                        const temp_idx = d * nnz * num_item + i * num_item + item;
+                        sum += temp[temp_idx];
+                    }
+                    // cx[d, node, item]
+                    const cx_idx = d * num_node * num_item + node * num_item + item;
+                    cx[cx_idx] = sum;
+                }
+            }
+        }
     """)
     _np_cfun = cfun
     def cfun(t, buffer, csr_weights, idelays2, horizon, validate=True):
