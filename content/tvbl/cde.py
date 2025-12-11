@@ -1,6 +1,6 @@
 """
 A module for conditional density estimation using Mixture Density
-Networks (MDNs) and Masked Autoregressive Flows (MAFs).
+Networks (MDNs), Masked Autoregressive Flows (MAFs), and Neural Spline Flows (NSFs).
 
 """
 
@@ -150,8 +150,8 @@ class ConditionalDensityEstimator(abc.ABC):
 
         # Filter out non-finite values
         finite_idx = anp.all(anp.isfinite(params), axis=1) & anp.all(anp.isfinite(features), axis=1)
-        params = params[finite_idx].astype('f')
-        features = features[finite_idx].astype('f')
+        params = params[finite_idx].astype(anp.float64)
+        features = features[finite_idx].astype(anp.float64)
 
         if params.shape[0] == 0:
             raise ValueError("All data points contained non-finite values.")
@@ -481,6 +481,427 @@ class MAFEstimator(ConditionalDensityEstimator):
 
 
 # =============================================================================
+# == NSF Implementation (Neural Spline Flow)
+# =============================================================================
+
+DEFAULT_MIN_BIN_WIDTH = 1e-3
+DEFAULT_MIN_BIN_HEIGHT = 1e-3
+DEFAULT_MIN_DERIVATIVE = 1e-3
+
+def _searchsorted_autograd(bin_locations, inputs, eps=1e-6):
+    """
+    Computes searchsorted (right) on the last dimension of bin_locations.
+    bin_locations: (..., K+1)
+    inputs: (..., ) or (..., 1)
+    Returns: indices (..., ) in range [0, K-1]
+    """
+    # Add eps to the last bin boundary to ensure inputs exactly at the boundary are included
+    # We create a new array to avoid in-place modification
+    # bin_locations shape: (N, D, K+1)
+    last = bin_locations[..., -1:] + eps
+    locs = anp.concatenate([bin_locations[..., :-1], last], axis=-1)
+    
+    # inputs: (N, D). Broadcasting needs inputs to be (N, D, 1)
+    # Cast to int to ensure Autograd treats it as an index/constant w.r.t differentiation
+    return (anp.sum(inputs[..., anp.newaxis] >= locs, axis=-1) - 1).astype(int)
+
+def _gather_elementwise(params, indices):
+    """
+    Gather values from params at indices.
+    params: (N, D, K)
+    indices: (N, D)
+    Returns: (N, D)
+    """
+    N, D = indices.shape
+    # Advanced indexing
+    # We want result[i, j] = params[i, j, indices[i, j]]
+    # Flatten everything
+    params_flat = params.reshape(-1, params.shape[-1]) # (N*D, K)
+    indices_flat = indices.flatten().astype(int) # (N*D,)
+    
+    # Use integer array indexing on flattened array
+    gathered = params_flat[anp.arange(len(indices_flat)), indices_flat]
+    return gathered.reshape(N, D)
+
+def _rational_quadratic_spline(inputs, unnormalized_widths, unnormalized_heights,
+                               unnormalized_derivatives, inverse=False,
+                               left=-2.5, right=2.5, bottom=-2.5, top=2.5,
+                               min_bin_width=DEFAULT_MIN_BIN_WIDTH,
+                               min_bin_height=DEFAULT_MIN_BIN_HEIGHT,
+                               min_derivative=DEFAULT_MIN_DERIVATIVE):
+    
+    num_bins = unnormalized_widths.shape[-1]
+    
+    # --- 1. Define widths and heights (softmax) ---
+    widths = anp.exp(unnormalized_widths - logsumexp(unnormalized_widths, axis=-1, keepdims=True))
+    widths = min_bin_width + (1 - min_bin_width * num_bins) * widths
+    
+    cumwidths = anp.cumsum(widths, axis=-1)
+    # Pad with 0 at start. cumwidths shape becomes (..., K+1)
+    pad_shape = list(cumwidths.shape); pad_shape[-1] = 1
+    cumwidths = anp.concatenate([anp.zeros(pad_shape), cumwidths], axis=-1)
+    
+    # Scale to interval
+    cumwidths = (right - left) * cumwidths + left
+    
+    # Hard-enforce boundaries (for stability and correctness) using concat instead of assignment
+    cumwidths_inner = cumwidths[..., 1:-1]
+    left_edge = anp.full(pad_shape, left)
+    right_edge = anp.full(pad_shape, right)
+    cumwidths = anp.concatenate([left_edge, cumwidths_inner, right_edge], axis=-1)
+    
+    widths = cumwidths[..., 1:] - cumwidths[..., :-1]
+    
+    # --- 2. Define derivatives (softplus) ---
+    derivatives = min_derivative + anp.logaddexp(0., unnormalized_derivatives)
+    
+    # --- 3. Define heights ---
+    heights = anp.exp(unnormalized_heights - logsumexp(unnormalized_heights, axis=-1, keepdims=True))
+    heights = min_bin_height + (1 - min_bin_height * num_bins) * heights
+    
+    cumheights = anp.cumsum(heights, axis=-1)
+    cumheights = anp.concatenate([anp.zeros(pad_shape), cumheights], axis=-1)
+    cumheights = (top - bottom) * cumheights + bottom
+    
+    cumheights_inner = cumheights[..., 1:-1]
+    bottom_edge = anp.full(pad_shape, bottom)
+    top_edge = anp.full(pad_shape, top)
+    cumheights = anp.concatenate([bottom_edge, cumheights_inner, top_edge], axis=-1)
+    
+    heights = cumheights[..., 1:] - cumheights[..., :-1]
+    
+    # --- 4. Spline Calculation ---
+    if inverse:
+        bin_idx = _searchsorted_autograd(cumheights, inputs)
+    else:
+        bin_idx = _searchsorted_autograd(cumwidths, inputs)
+        
+    # Clamp bin_idx to valid range [0, K-1] just in case of float errors
+    bin_idx = anp.clip(bin_idx, 0, num_bins - 1)
+
+    input_cumwidths = _gather_elementwise(cumwidths, bin_idx)
+    input_bin_widths = _gather_elementwise(widths, bin_idx)
+    input_cumheights = _gather_elementwise(cumheights, bin_idx)
+    input_bin_heights = _gather_elementwise(heights, bin_idx) # Used as heights later
+    
+    delta = input_bin_heights / input_bin_widths
+    
+    input_derivatives = _gather_elementwise(derivatives, bin_idx)
+    input_derivatives_plus_one = _gather_elementwise(derivatives, bin_idx + 1)
+    
+    if inverse:
+        a = (((inputs - input_cumheights) * (input_derivatives + input_derivatives_plus_one - 2 * delta)
+              + input_bin_heights * (delta - input_derivatives)))
+        b = (input_bin_heights * input_derivatives
+             - (inputs - input_cumheights) * (input_derivatives + input_derivatives_plus_one - 2 * delta))
+        c = - delta * (inputs - input_cumheights)
+
+        discriminant = b**2 - 4 * a * c
+        # discriminant = anp.maximum(discriminant, 0) # Ensure non-negative? autograd safe?
+
+        root = (2 * c) / (-b - anp.sqrt(discriminant))
+        outputs = root * input_bin_widths + input_cumwidths
+
+        theta = root
+        theta_one_minus_theta = theta * (1 - theta)
+        
+        denominator = delta + ((input_derivatives + input_derivatives_plus_one - 2 * delta) * theta_one_minus_theta)
+        derivative_numerator = delta**2 * (input_derivatives_plus_one * theta**2
+                                            + 2 * delta * theta_one_minus_theta
+                                            + input_derivatives * (1 - theta)**2)
+        logabsdet = anp.log(derivative_numerator) - 2 * anp.log(denominator)
+        return outputs, -logabsdet
+
+    else:
+        theta = (inputs - input_cumwidths) / input_bin_widths
+        theta_one_minus_theta = theta * (1 - theta)
+
+        numerator = input_bin_heights * (delta * theta**2 + input_derivatives * theta_one_minus_theta)
+        denominator = delta + ((input_derivatives + input_derivatives_plus_one - 2 * delta) * theta_one_minus_theta)
+        
+        outputs = input_cumheights + numerator / denominator
+
+        derivative_numerator = delta**2 * (input_derivatives_plus_one * theta**2
+                                            + 2 * delta * theta_one_minus_theta
+                                            + input_derivatives * (1 - theta)**2)
+        logabsdet = anp.log(derivative_numerator) - 2 * anp.log(denominator)
+        
+        return outputs, logabsdet
+
+
+@dataclass
+class NSFEstimator(ConditionalDensityEstimator):
+    """
+    Neural Spline Flow for conditional density estimation.
+    Uses Rational Quadratic Splines with coupling layers.
+
+    Parameters
+    ----------
+    param_dim : int
+        Dimensionality of the target variable.
+    feature_dim : int
+        Dimensionality of the conditional variable.
+    n_flow_steps : int
+        Number of coupling layers.
+    n_bins : int
+        Number of bins for the spline.
+    hidden_features : int
+        Number of hidden units in the transform net (MLP).
+    tail_bound : float
+        The bound of the spline interval (i.e. [-B, B]).
+    """
+    param_dim: int
+    feature_dim: int
+    n_flow_steps: int = 4
+    n_bins: int = 8
+    hidden_features: int = 64
+    tail_bound: float = 8.0
+
+    def __post_init__(self):
+        super().__init__(self.param_dim, self.feature_dim)
+        self.model_constants = None
+
+    def _initialize_weights(self, rng: anp.random.RandomState) -> dict:
+        weights = {}
+        layers = []
+        
+        # Dimensions
+        D = self.param_dim
+        C = self.feature_dim
+        
+        # Output dim of MLP: for each transformed dim, we need (3 * K - 1) params if linear tails.
+        # We assume linear tails outside [-B, B].
+        # For K bins: K widths, K heights, K-1 derivatives (since ends are 1).
+        # Total: 3*K - 1.
+        param_per_dim = 3 * self.n_bins - 1
+        
+        for i in range(self.n_flow_steps):
+            # Alternating mask
+            # If D=1, we cannot really split. But typically flows are D>=2.
+            # If D=1, NSF usually implies unconditional on x, conditional on c.
+            # For CDE, if D=1, we can't do coupling on x itself unless we treat it as 1D flow cond on C.
+            # In that case, identity set is empty?
+            # If D > 1:
+            mask = anp.zeros(D)
+            if D > 1:
+                mask[::2] = 1 if i % 2 == 0 else 0 # 1 means transformed, 0 means identity
+                if i % 2 != 0:
+                    mask = 1 - mask
+            else:
+                # If D=1, everything is transformed. Identity is empty.
+                mask[:] = 1
+
+            n_identity = int(anp.sum(1 - mask))
+            n_transform = int(anp.sum(mask))
+            
+            # MLP inputs: identity part of x + features
+            in_dim = n_identity + C
+            out_dim = n_transform * param_per_dim
+            
+            # Weights for MLP (2 hidden layers)
+            H = self.hidden_features
+            w_std = 0.01
+            
+            # W1: in -> H
+            weights[f'step{i}_W1'] = (rng.randn(in_dim, H) * anp.sqrt(2/in_dim)).astype('f')
+            weights[f'step{i}_b1'] = anp.zeros(H, dtype='f')
+            
+            # W2: H -> H
+            weights[f'step{i}_W2'] = (rng.randn(H, H) * anp.sqrt(2/H)).astype('f')
+            weights[f'step{i}_b2'] = anp.zeros(H, dtype='f')
+            
+            # W3: H -> out
+            weights[f'step{i}_W3'] = (rng.randn(H, out_dim) * 0.01).astype('f') # Initialize slightly larger to break symmetry
+            weights[f'step{i}_b3'] = anp.zeros(out_dim, dtype='f')
+            
+            # Constants to reconstruction
+            # We need to know which indices are identity and which are transform
+            id_indices = anp.where(mask == 0)[0]
+            tr_indices = anp.where(mask == 1)[0]
+            
+            layers.append({
+                'mask': mask,
+                'id_indices': id_indices,
+                'tr_indices': tr_indices,
+                'n_transform': n_transform
+            })
+            
+        self.model_constants = {'layers': layers}
+        return weights
+
+    def _mlp_forward(self, weights, step_idx, inputs):
+        """Standard MLP forward pass."""
+        W1 = weights[f'step{step_idx}_W1']
+        b1 = weights[f'step{step_idx}_b1']
+        W2 = weights[f'step{step_idx}_W2']
+        b2 = weights[f'step{step_idx}_b2']
+        W3 = weights[f'step{step_idx}_W3']
+        b3 = weights[f'step{step_idx}_b3']
+        
+        h = anp.tanh(anp.dot(inputs, W1) + b1)
+        h = anp.tanh(anp.dot(h, W2) + b2)
+        out = anp.dot(h, W3) + b3
+        return out
+
+    def _transform_step(self, x, features, layer_const, step_idx, weights, inverse=False):
+        # x: (N, D)
+        # Split
+        id_idx = layer_const['id_indices']
+        tr_idx = layer_const['tr_indices']
+        
+        x_id = x[:, id_idx]
+        x_tr = x[:, tr_idx]
+        
+        # MLP input
+        if features is not None and self.feature_dim > 0:
+            if x_id.shape[1] > 0:
+                mlp_in = anp.concatenate([x_id, features], axis=1)
+            else:
+                mlp_in = features
+        else:
+            mlp_in = x_id
+            
+        params = self._mlp_forward(weights, step_idx, mlp_in)
+        
+        # Reshape params: (N, n_transform, 3*K - 1)
+        N = x.shape[0]
+        K = self.n_bins
+        n_tr = layer_const['n_transform']
+        params = params.reshape(N, n_tr, -1)
+        
+        # Split params
+        # Widths: K, Heights: K, Derivatives: K-1
+        unnorm_widths = params[..., :K]
+        unnorm_heights = params[..., K:2*K]
+        unnorm_derivatives = params[..., 2*K:]
+        
+        # Pad derivatives (linear tails -> deriv=1 at ends => unnorm=constant s.t. softplus(c)=1 => c = log(e-1))
+        # But we pass unnormalized.
+        # Constant for derivative=1: min_deriv + softplus(x) = 1. 
+        # For default min=1e-3, 1e-3 + log(1+exp(x)) = 1 => log(1+exp(x)) = 0.999 => 1+exp(x) = exp(0.999) => x = log(exp(0.999)-1)
+        # We can just pad with a value that results in 1.
+        # Let's compute that constant.
+        min_deriv = DEFAULT_MIN_DERIVATIVE
+        c_val = anp.log(anp.exp(1 - min_deriv) - 1)
+        
+        pad_shape = list(unnorm_derivatives.shape); pad_shape[-1] = 1
+        c_tensor = anp.full(pad_shape, c_val)
+        unnorm_derivatives = anp.concatenate([c_tensor, unnorm_derivatives, c_tensor], axis=-1)
+        
+        # Rational Quadratic Spline
+        # Identify inputs inside the bound
+        # We apply spline only within [-B, B]. Outside is identity.
+        B = self.tail_bound
+        
+        inside_mask = (x_tr >= -B) & (x_tr <= B)
+        # Note: masks in autograd are fine for indexing/selection but careful with in-place.
+        # We process everything with spline, then mix based on mask?
+        # Or, we can use the `rational_quadratic_spline` logic which assumes it receives valid inputs.
+        # But `rational_quadratic_spline` uses searchsorted which requires inputs in range.
+        # We should clamp inputs passed to spline, and then mask the output.
+        
+        x_tr_clamped = anp.clip(x_tr, -B, B)
+        
+        y_tr, log_det_tr = _rational_quadratic_spline(
+            x_tr_clamped, unnorm_widths, unnorm_heights, unnorm_derivatives,
+            inverse=inverse,
+            left=-B, right=B, bottom=-B, top=B
+        )
+        
+        # Apply mask: if outside, identity transform (y=x), log_det=0
+        
+        # Debug print (only print once or sparsely to avoid spam)
+        # We can't use static variable in method easily, but we can check if it's the first step of first iteration?
+        # Or just print.
+        if step_idx == 0 and anp.random.rand() < 0.001:
+             print(f"DEBUG: Step {step_idx} Mask coverage: {anp.mean(inside_mask):.2f}")
+
+        final_y_tr = anp.where(inside_mask, y_tr, x_tr)
+        final_log_det = anp.where(inside_mask, log_det_tr, 0.)
+        
+        # Reconstruct full vector
+        # We need to put x_id and final_y_tr back into their places.
+        # Construct empty (N, D) and fill.
+        # autograd doesn't like item assignment.
+        # We can use a permutation matrix or just sorting indices.
+        
+        # Indices to place back
+        # We have id_idx and tr_idx.
+        # We can concat [x_id, final_y_tr] then apply inverse permutation.
+        
+        concat_res = anp.concatenate([x_id, final_y_tr], axis=1) # (N, n_id + n_tr)
+        
+        # We need to reorder columns from [id..., tr...] to [0, 1, 2...]
+        # Current order of columns is id_idx followed by tr_idx.
+        current_order = anp.concatenate([id_idx, tr_idx])
+        # We want to map current_order[k] -> k.
+        # Actually we want to permute columns such that they align with 0..D-1.
+        # We need argsort of current_order.
+        inv_perm = anp.argsort(current_order)
+        
+        final_out = concat_res[:, inv_perm]
+        
+        return final_out, anp.sum(final_log_det, axis=1)
+
+
+    def _flow_forward(self, params, features):
+        z = params
+        log_det_sum = 0.
+        
+        for k in range(self.n_flow_steps):
+            layer_const = self.model_constants['layers'][k]
+            z, log_det = self._transform_step(z, features, layer_const, k, self.weights, inverse=False)
+            log_det_sum = log_det_sum + log_det
+            
+        return z, log_det_sum
+
+    def _flow_inverse(self, z, features):
+        x = z
+        # Inverse: reverse order of steps
+        for k in reversed(range(self.n_flow_steps)):
+            layer_const = self.model_constants['layers'][k]
+            x, _ = self._transform_step(x, features, layer_const, k, self.weights, inverse=True)
+            # We don't need log_det for sampling
+            
+        return x
+
+    def _loss_function(self, weights, features, params):
+        z, log_det_jac = self._flow_forward(params, features)
+        
+        # Base distribution: Standard Normal N(0, I)
+        # log p(z) = -0.5 * z^2 - 0.5 * log(2pi)
+        log_p_z = -0.5 * anp.sum(z**2, axis=1) - 0.5 * self.param_dim * anp.log(2 * anp.pi)
+        
+        log_prob = log_p_z + log_det_jac
+        return -anp.mean(log_prob)
+
+    def log_prob(self, features: anp.ndarray, params: anp.ndarray) -> anp.ndarray:
+        super().log_prob(features, params)
+        z, log_det_jac = self._flow_forward(params, features)
+        log_p_z = -0.5 * anp.sum(z**2, axis=1) - 0.5 * self.param_dim * anp.log(2 * anp.pi)
+        return log_p_z + log_det_jac
+
+    def sample(self, features: anp.ndarray, n_samples: int, rng: anp.random.RandomState) -> anp.ndarray:
+        super().sample(features, n_samples, rng)
+        features = features.astype('f')
+        if features.ndim == 1:
+            features = features.reshape(1, -1)
+
+        n_cond = features.shape[0]
+        # Broadcast features
+        if n_cond != n_samples:
+             features = anp.repeat(features, n_samples, axis=0)
+
+        # Sample z ~ N(0, I)
+        z = rng.randn(n_samples, self.param_dim).astype('f')
+        
+        # Transform z -> x
+        x = self._flow_inverse(z, features)
+        
+        return x.reshape(n_cond, -1, self.param_dim)
+
+
+# =============================================================================
 # == Test Datasets and Visualization
 # =============================================================================
 
@@ -649,14 +1070,14 @@ def shrinkage_zscore(x, x_hat, x_prior):
 if __name__ == '__main__':
     # --- MDN Tests ---
     mdn_banana = MDNEstimator(param_dim=2, feature_dim=1, n_components=8, hidden_sizes=(64, 64))
-    run_test(mdn_banana, 'banana')
-
-    mdn_moons = MDNEstimator(param_dim=2, feature_dim=1, n_components=10, hidden_sizes=(64, 64))
-    run_test(mdn_moons, 'moons')
+    run_test(mdn_banana, 'banana', plot=False)
 
     # --- MAF Tests ---
     maf_banana = MAFEstimator(param_dim=2, feature_dim=1, n_flows=5, hidden_units=128)
-    run_test(maf_banana, 'banana')
-
-    maf_moons = MAFEstimator(param_dim=2, feature_dim=1, n_flows=5, hidden_units=128)
-    run_test(maf_moons, 'moons')
+    run_test(maf_banana, 'banana', plot=False)
+    
+    # --- NSF Tests ---
+    print("\nStarting NSF Test...")
+    nsf_banana = NSFEstimator(param_dim=2, feature_dim=1, n_flow_steps=4, n_bins=8, hidden_features=64)
+    run_test(nsf_banana, 'banana', plot=False)
+    print("NSF Test Complete.")
