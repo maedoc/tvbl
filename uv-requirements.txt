@@ -1,1 +1,15 @@
-jupyterlab matplotlib scipy autograd tqdm joblib scikit_learn ipywidgets
+jupyterlab
+matplotlib
+scipy
+autograd
+tqdm
+joblib
+scikit_learn
+ipywidgets
+mne
+ebrains-drive
+pyunicore
+tslearn
+catppuccin-jupyterlab
+corner
+pooch
