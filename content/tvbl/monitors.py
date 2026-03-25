@@ -9,8 +9,9 @@ vbjax, as it more amenable to autodiff than TVB core code.
 
 import collections
 import numpy as np
-from tvbl import heun
-from util import scan
+
+from .core import heun
+from .util import scan
 
 
 BOLDTheta = collections.namedtuple(
