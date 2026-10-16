@@ -1,5 +1,11 @@
 name: xeus-kernel
 channels:
+  # NOTE: emscripten-forge-4x MUST come before emscripten-forge-dev.
+  # numba/llvmlite only exist on 4x (emscripten-abi 4.x), while dev is the
+  # emscripten 3.1.73 channel -- dev-first would silently mix both ABIs and
+  # hand us a broken kernel env (solver happily picks python from 4x and
+  # matplotlib from dev).
+  - https://repo.prefix.dev/emscripten-forge-4x
   - https://repo.prefix.dev/emscripten-forge-dev
   - https://repo.prefix.dev/conda-forge
 dependencies:
@@ -15,6 +21,7 @@ dependencies:
   - setuptools
   - jupyterlite-terminal
   - pandas
+  - numba
   - pip
   - pip:
     - mne

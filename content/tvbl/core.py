@@ -70,12 +70,18 @@ try:
     def cfun(t, buffer, csr_weights, idelays2, horizon, validate=True):
         cx_np = _np_cfun(t, buffer, csr_weights, idelays2, horizon)
         cx = np.zeros(cx_np.shape, 'f')
-        j_cx = pyjs.buffer_to_js_typed_array(cx, view=True)
-        j_buffer = pyjs.buffer_to_js_typed_array(buffer, view=True)
-        j_indices = pyjs.buffer_to_js_typed_array(csr_weights.indices, view=True)
-        j_weights = pyjs.buffer_to_js_typed_array(csr_weights.data, view=True)
-        j_indptr = pyjs.buffer_to_js_typed_array(csr_weights.indptr, view=True)
-        j_idelays2 = pyjs.buffer_to_js_typed_array(idelays2, view=True)
+        # pyjs' buffer_to_js_typed_array only accepts 1-D buffers (it calls
+        # py_1d_buffer_to_typed_array), so hand it flat views.  All arrays
+        # here are C-contiguous, so reshape(-1) is a view and the JS writes
+        # to j_cx still land in cx; the index arithmetic in the JS above
+        # matches C-order flattening of (2, num_node, num_item),
+        # (num_node, horizon, num_item) and (2, nnz) respectively.
+        j_cx = pyjs.buffer_to_js_typed_array(cx.reshape(-1), view=True)
+        j_buffer = pyjs.buffer_to_js_typed_array(buffer.reshape(-1), view=True)
+        j_indices = pyjs.buffer_to_js_typed_array(csr_weights.indices.reshape(-1), view=True)
+        j_weights = pyjs.buffer_to_js_typed_array(csr_weights.data.reshape(-1), view=True)
+        j_indptr = pyjs.buffer_to_js_typed_array(csr_weights.indptr.reshape(-1), view=True)
+        j_idelays2 = pyjs.buffer_to_js_typed_array(idelays2.reshape(-1), view=True)
         _js_cfun(j_cx, t, j_buffer, j_indices, j_weights, j_indptr, j_idelays2, horizon)
         assert np.allclose(cx, cx_np, atol=1e-5)
         return cx

@@ -1,6 +1,7 @@
 jupyterlab
 matplotlib
 scipy
+numba
 autograd
 tqdm
 joblib

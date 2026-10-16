@@ -17,7 +17,7 @@ import numpy as np
 import scipy.sparse
 
 # Import directly from core to avoid circular import issues
-import core
+from . import core
 cfun = core.cfun
 
 
