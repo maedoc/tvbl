@@ -37,52 +37,56 @@ pytest
 
 ## run tests (wasm path)
 
-The suite can also be run against the wasm build of the code — i.e. inside an
-`emscripten-wasm32` Python where `pyjs` is importable and `tvbl.core.cfun`
-actually uses the JavaScript implementation (validating it against numpy
-within 1e-5). This is what runs inside JupyterLite, so it is the path worth
-running before a deploy.
+The upstream `tvb_library` suite runs against the wasm build — i.e. inside an
+`emscripten-wasm32` Python where `pyjs` is importable and numba/llvmlite JIT
+into the browser's WebAssembly memory. This is the same environment the
+JupyterLite kernel uses, so it is the path worth checking before a deploy.
 
-You need **micromamba** (it is what `build-environment.yml` / CI uses, and the
-only way to create an `emscripten-wasm32` env), `pyjs-code-runner` (drives a
-headless chromium via playwright) and a wasm env:
+`wasm-tests/run.sh` creates the wasm env (on first run), installs
+`tvb_library` from the sibling checkout at `../tvb/tvb_library` (or from the
+fork on GitHub when that checkout is absent), installs `tvb-data`, patches a
+private copy of the pyjs runtime, and runs the tests in headless chromium.
+
+Prerequisites (one-time):
 
 ```sh
-# one-time: micromamba
-curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest | tar -xj -C /tmp bin/micromamba
-mv /tmp/bin/micromamba ~/.local/bin/
+# micromamba (creates the emscripten-wasm32 env)
+curl -Ls https://micro.mamba.pm/api/micromamba/osx-arm64/latest | tar -xj -C /tmp bin/micromamba
+mv /tmp/bin/micromamba ~/.local/bin/      # linux-64: .../linux-64/latest
 
-# one-time: the wasm env (same channels/order as environment.yml, plus
-# pytest/pyjs; 4x must precede dev or the ABI is mixed -- numba only exists on 4x)
-export MAMBA_ROOT_PREFIX=~/.micromamba
-micromamba create -n tvbl-wasm --platform emscripten-wasm32 \
-  -c https://repo.prefix.dev/emscripten-forge-4x \
-  -c https://repo.prefix.dev/emscripten-forge-dev \
-  -c https://repo.prefix.dev/conda-forge \
-  python numpy scipy tqdm pytest pyjs autograd numba
-
-# one-time: the host-side runner
+# host-side runner (drives playwright/chromium)
 uv venv ~/.venvs/pyjs-runner
 uv pip install --python ~/.venvs/pyjs-runner/bin/python pyjs-code-runner
 ~/.venvs/pyjs-runner/bin/playwright install chromium
 ```
 
-Then, to run the tests:
+Then:
 
 ```sh
 ./wasm-tests/run.sh
 ```
 
-It packs the wasm env with `empack`, patches a private copy of the pyjs runtime
-(see the numba note below), mounts `content/tvbl` and
-`wasm-tests/run_wasm_tests.py` into the emscripten filesystem, runs pytest in
-headless chromium and exits non-zero on failure (so it is CI-able). Paths can
-be overridden with `TVBL_WASM_ENV` and `PYJS_RUNNER`.
+The env is created with every package in one `micromamba create` (installing
+into an existing wasm env later fails because micromamba tries to run the wasm
+`python`). Paths can be overridden with `TVBL_WASM_ENV`, `TVB_LIBRARY_SRC`
+(e.g. point at `../tvb/tvb_library` explicitly), `TVB_LIBRARY_SPEC`,
+`PYJS_RUNNER`, and `HOST_PYTHON`. `TVBL_SKIP_INSTALL=1` reuses the packages
+already in the env.
+
+Expected result in this checkout: **1448 passed, 94 skipped**. The skips are
+environmental, not disabled functionality: GPU/CUDA tests, six `tvb-gdist`
+tests (no emscripten build), multiprocessing/prange tests (emscripten has no
+processes), one numba kernel whose analysis pass needs >2 GiB, and one
+benchmark that allocates beyond the wasm memory ceiling. They are skipped by
+`wasm-tests/run_wasm_tests.py` with a reason in the pytest report.
+
+The suite is split into five chunks (basic, datatypes, simulator top-level,
+backend, hybrid), each in a fresh browser process. A single process running
+everything exhausts the 2 GiB wasm memory late in the suite
+(`_ArrayMemoryError`) even though each chunk passes on its own.
 
 Gotchas learned the hard way:
 
-- `micromamba install` into an existing wasm env fails (`pip inspect` tries to
-  run the wasm `python`); create the env with every package in one `create`.
 - `pyjs-code-runner`'s `node` backend does not work with the emscripten-forge
   pyjs build — it only ships `pyjs_runtime_browser.{js,wasm}` — so use
   `browser-main --headless`.
@@ -101,13 +105,12 @@ Gotchas learned the hard way:
   resolve numba's `NRT_*` imports and every `@njit` call taking an array dies
   with `Dynamic linking error: cannot resolve symbol
   NRT_adapt_ndarray_from_python` (scalar-only `@njit` is fine).
-  `wasm-tests/run.sh` works around it by patching that one flag in a private
-  copy of `pyjs_runtime_browser.js` and passing it via `--pyjs-dir`. This is
-  probably worth reporting upstream to emscripten-forge/pyjs — if the deployed
-  JupyterLite kernel boots its env the same way, it is affected too.
-- `environment.yml` (the deployed site kernel) has no `pytest`; to run the
-  suite *inside* the deployed JupyterLite, add `pytest` there (it exists on
-  emscripten-forge).
+  `wasm-tests/run.sh` patches that one flag in a private copy of
+  `pyjs_runtime_browser.js` and passes it via `--pyjs-dir`. This is worth
+  reporting upstream to emscripten-forge/pyjs.
+- The JupyterLite kernel env (`environment.yml`) installs `tvb-library` and
+  `tvb-data` through the `pip:` section. `jupyterlite-xeus` runs host pip with
+  `--target` and only supports pure-Python wheels, which is all tvb needs.
 
 ## ideas
 

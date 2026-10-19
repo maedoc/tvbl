@@ -22,6 +22,14 @@ dependencies:
   - jupyterlite-terminal
   - pandas
   - numba
+  - networkx
+  - numexpr
+  - mako
+  - deprecated
+  - docutils
+  - autopep8
+  - six
+  - h5py
   - pip
   - pip:
     - mne
@@ -31,3 +39,9 @@ dependencies:
     - catppuccin-jupyterlab
     - corner
     - pooch
+    # tvb-library is pure Python.  Use the fork with the numba/hybrid
+    # backends (PyPI's 2.10 release predates them).  When building locally
+    # from a sibling checkout you can replace this with:
+    #   - ../tvb/tvb_library
+    - "tvb-library @ git+https://github.com/maedoc/tvb.git#subdirectory=tvb_library"
+    - tvb-data

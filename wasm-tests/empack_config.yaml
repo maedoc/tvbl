@@ -1,0 +1,52 @@
+# empack filtering for the wasm test runner.
+#
+# The default empack config excludes `**/tests/**` (which is right for a
+# deployed JupyterLite env, but wrong here).  tvb_library and tvb_data are
+# installed as pip packages, so empack can pick them up from their RECORD
+# files -- we only override their exclude patterns to keep the tests.
+packages:
+  setuptools:
+    exclude_patterns:
+      - pattern: '**/_distutils_hack/**'
+      - pattern: '**/distutils-precedence.pth'
+      - pattern: '**/setuptools/**'
+      - pattern: '**/pkg_resources/_vendor/**'
+  zlib:
+    exclude_patterns:
+      - pattern: '**/so'
+  widgetsnbextension:
+    exclude_patterns:
+      - pattern: '**'
+  numpy:
+    exclude_patterns:
+      - pattern: '**/*.pyx'
+      - pattern: '**/*.pyc'
+      - pattern: '**/*.typed'
+      - pattern: '**/*.egg-info'
+  tvb_library:
+    exclude_patterns:
+      - pattern: '**/__pycache__/**'
+      - pattern: '**/*.pyc'
+  tvb_data:
+    exclude_patterns:
+      - pattern: '**/__pycache__/**'
+      - pattern: '**/*.pyc'
+default:
+  exclude_patterns:
+    - pattern: 'bin/**'
+    - pattern: '**/bin/**'
+    - pattern: '**/*.ini'
+    - pattern: '**/*.exe'
+    - pattern: '**/*.c'
+    - pattern: '**/*.pxd'
+    - pattern: '**/*.pyx'
+    - pattern: '**/*.pyc'
+    - pattern: '**/*.typed'
+    - pattern: '**/*.egg-info'
+    - pattern: '**/site-packages/pip/_vendor/**'
+    - pattern: '**/idlelib/**'
+    - pattern: '**/ensurepip/**'
+    - pattern: 'Scripts/*'
+    - pattern: 'share/jupyter/nbextensions/**'
+    - pattern: 'share/jupyter/labextensions/**'
+    - pattern: 'etc/jupyter/nbconfig/**'

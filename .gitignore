@@ -115,3 +115,8 @@ dmypy.json
 *.doit.db
 _output
 cockle_wasm_env
+
+# wasm test runner
+wasm-tests/.cache/
+wasm-tests/.pyjs-patched/
+wasm-tests/chunk.txt
