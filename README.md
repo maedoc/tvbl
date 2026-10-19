@@ -43,9 +43,10 @@ into the browser's WebAssembly memory. This is the same environment the
 JupyterLite kernel uses, so it is the path worth checking before a deploy.
 
 `wasm-tests/run.sh` creates the wasm env (on first run), installs
-`tvb_library` from the sibling checkout at `../tvb/tvb_library` (or from the
-fork on GitHub when that checkout is absent), installs `tvb-data`, patches a
-private copy of the pyjs runtime, and runs the tests in headless chromium.
+`tvb_library` from the sibling checkout at `../tvb/tvb_library` (or from
+`the-virtual-brain/tvb-root@master` when that checkout is absent), installs
+`tvb-data`, patches a private copy of the pyjs runtime, and runs the tests in
+headless chromium.
 
 Prerequisites (one-time):
 
@@ -117,6 +118,10 @@ Gotchas learned the hard way:
 - The JupyterLite kernel env (`environment.yml`) installs `tvb-library` and
   `tvb-data` through the `pip:` section. `jupyterlite-xeus` runs host pip with
   `--target` and only supports pure-Python wheels, which is all tvb needs.
+  pip accepts a VCS ref there, so the package is pinned to
+  `git+https://github.com/the-virtual-brain/tvb-root.git@master#subdirectory=tvb_library`
+  rather than the older PyPI release. Use `@<tag>` or `@<commit>` for a
+  reproducible pin; pip clones with `--filter=blob:none` (a few seconds).
 
 ## ideas
 

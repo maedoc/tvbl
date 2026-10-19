@@ -25,7 +25,7 @@ PYJS_RUNNER="${PYJS_RUNNER:-$HOME/.venvs/pyjs-runner/bin/pyjs_code_runner}"
 HOST_PYTHON="${HOST_PYTHON:-python3}"
 CACHE_DIR="${PYJS_CACHE_DIR:-$ROOT/wasm-tests/.cache}"
 PATCHED_PYJS="${PYJS_PATCH_DIR:-$ROOT/wasm-tests/.pyjs-patched}"
-TVB_LIBRARY_SPEC="${TVB_LIBRARY_SPEC:-tvb-library @ git+https://github.com/maedoc/tvb.git#subdirectory=tvb_library}"
+TVB_LIBRARY_SPEC="${TVB_LIBRARY_SPEC:-tvb-library @ git+https://github.com/the-virtual-brain/tvb-root.git@master#subdirectory=tvb_library}"
 
 if [ -d "${TVB_LIBRARY_SRC:-$ROOT/../tvb/tvb_library}" ]; then
     TVB_LIBRARY_SRC="${TVB_LIBRARY_SRC:-$ROOT/../tvb/tvb_library}"
