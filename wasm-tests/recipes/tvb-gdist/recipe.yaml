@@ -1,0 +1,47 @@
+context:
+  version: 2.9.2
+  name: tvb-gdist
+
+package:
+  name: ${{ name }}
+  version: ${{ version }}
+
+source:
+  url: https://files.pythonhosted.org/packages/0d/2d/f477ec8611b82a4fa1620cb429c89814e3eeb9a8554546dc25da5a09f3c5/tvb_gdist-2.9.2.tar.gz
+  sha256: 9f8843d4fd4a945979e3f26a87da895022d45145775228fa706a43caa8965df8
+
+build:
+  number: 0
+  script: build.sh
+
+requirements:
+  build:
+    - ${{ compiler("cxx") }}
+    - cross-python_${{ target_platform }}
+    - python
+    - cython
+    - numpy
+    - pip
+  host:
+    - python
+    - numpy
+  run:
+    - python
+    - numpy
+    - scipy
+
+tests:
+  - script: pytester
+    requirements:
+      build:
+        - pytester
+      run:
+        - pytester-run
+    files:
+      recipe:
+        - test_gdist.py
+
+about:
+  homepage: https://github.com/the-virtual-brain/tvb-gdist
+  license: GPL-3.0-or-later
+  summary: Compute geodesic distances on triangular meshes

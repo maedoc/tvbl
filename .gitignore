@@ -120,3 +120,7 @@ cockle_wasm_env
 wasm-tests/.cache/
 wasm-tests/.pyjs-patched/
 wasm-tests/chunk.txt
+
+# CI-built wasm packages / generated kernel env
+local-channel/
+environment.ci.yml

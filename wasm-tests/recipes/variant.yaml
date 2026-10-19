@@ -1,0 +1,12 @@
+# Minimal rattler-build variant for wasm packages built by this repo.
+# Matches the emscripten toolchain used by emscripten-forge-4x.
+c_compiler:
+  - emscripten
+cxx_compiler:
+  - emscripten
+c_compiler_version:
+  - "4.0.9"
+cxx_compiler_version:
+  - "4.0.9"
+zip_keys:
+  - [c_compiler_version, cxx_compiler_version]

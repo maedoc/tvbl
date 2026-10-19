@@ -85,6 +85,12 @@ backend, hybrid), each in a fresh browser process. A single process running
 everything exhausts the 2 GiB wasm memory late in the suite
 (`_ArrayMemoryError`) even though each chunk passes on its own.
 
+The GitHub Actions deployment additionally builds `tvb-gdist` with the
+`rattler-build` recipe in `wasm-tests/recipes/tvb-gdist`, publishes it to a
+local channel, and installs it into the kernel env. The test runner above does
+not build it by default (see the recipe README for the local workflow); the
+deployed site therefore has working surface/geodesic functionality.
+
 Gotchas learned the hard way:
 
 - `pyjs-code-runner`'s `node` backend does not work with the emscripten-forge

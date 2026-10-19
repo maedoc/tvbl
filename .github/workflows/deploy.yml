@@ -27,11 +27,47 @@ jobs:
           environment-file: build-environment.yml
           cache-environment: true
 
+      - name: Build the tvb-gdist wasm package
+        shell: bash -l {0}
+        run: |
+          rattler-build build \
+            --recipe wasm-tests/recipes/tvb-gdist \
+            --target-platform emscripten-wasm32 \
+            --test skip \
+            --output-dir "$GITHUB_WORKSPACE/local-channel" \
+            -c https://repo.prefix.dev/emscripten-forge-4x \
+            -c https://repo.prefix.dev/emscripten-forge-dev \
+            -c https://repo.prefix.dev/conda-forge \
+            -c microsoft \
+            -m wasm-tests/recipes/variant.yaml
+
+      - name: Add tvb-gdist to the kernel environment
+        shell: bash -l {0}
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          root = Path.cwd()
+          lines = Path("environment.yml").read_text().splitlines()
+          out = []
+          for line in lines:
+              out.append(line)
+              if line.strip() == "channels:":
+                  out.append(f"  - file://{root}/local-channel")
+          lines, out = out, []
+          for line in lines:
+              out.append(line)
+              if line.strip() == "dependencies:":
+                  out.append("  - tvb-gdist")
+          Path("environment.ci.yml").write_text("\n".join(out) + "\n")
+          PY
+
       - name: Build the JupyterLite site
         shell: bash -l {0}
         run: |
           cp README.md content
-          jupyter lite build --contents content --output-dir dist
+          jupyter lite build --contents content --output-dir dist \
+            --XeusAddon.environment_file=environment.ci.yml
           cp -rv dist/extensions/catppuccin_jupyterlab/themes/catppuccin_jupyterlab dist/build/themes/
 
       - name: Upload artifact
