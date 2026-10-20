@@ -51,3 +51,5 @@ dependencies:
     # and append @<sha> before the "#".
     - "tvb-library @ git+https://github.com/the-virtual-brain/tvb-root.git@master#subdirectory=tvb_library"
     - tvb-data
+    # the demos use %matplotlib widget
+    - ipympl
