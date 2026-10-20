@@ -43,7 +43,7 @@ if [ ! -d "$ENV_PREFIX" ] && [ "${TVBL_SKIP_ENV:-0}" != 1 ]; then
         -c https://repo.prefix.dev/emscripten-forge-4x \
         -c https://repo.prefix.dev/emscripten-forge-dev \
         -c https://repo.prefix.dev/conda-forge \
-        python numpy scipy matplotlib autograd tqdm scikit-learn ipywidgets \
+        python numpy scipy 'matplotlib<3.11' autograd tqdm scikit-learn ipywidgets \
         joblib setuptools pandas numba pytest pytest-benchmark pyjs \
         networkx numexpr mako deprecated six autopep8 docutils packaging \
         pip h5py

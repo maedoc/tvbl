@@ -117,9 +117,10 @@ _output
 cockle_wasm_env
 
 # wasm test runner
-wasm-tests/.cache/
-wasm-tests/.pyjs-patched/
+wasm-tests/.cache*/
+wasm-tests/.pyjs-patched*/
 wasm-tests/chunk.txt
+wasm-tests/notebook.txt
 
 # CI-built wasm packages / generated kernel env
 local-channel/

@@ -86,6 +86,27 @@ backend, hybrid), each in a fresh browser process. A single process running
 everything exhausts the 2 GiB wasm memory late in the suite
 (`_ArrayMemoryError`) even though each chunk passes on its own.
 
+### Notebook demos
+
+`content/demos/` holds a few upstream TVB demos (region-level simulation,
+reduced Wong–Wang, and the hybrid JansenRit → FHN example). They are ordinary
+notebooks; to execute them headlessly in the wasm runtime use:
+
+```sh
+~/.venvs/pyjs-runner/bin/pyjs_code_runner run script browser-main \
+  --conda-env ~/.micromamba/envs/tvbl-wasm \
+  --script /work/run_notebooks.py \
+  --mount "$PWD/wasm-tests:/work" \
+  --mount "$PWD/content/demos:/work/notebooks" \
+  --pyjs-dir "$PWD/wasm-tests/.pyjs-patched" \
+  --file-filter "$PWD/wasm-tests/empack_config.yaml" \
+  --headless -w /home/web_user
+```
+
+`run_notebooks.py` executes all `*.ipynb` in the mounted directory (or the
+single name in `/work/notebook.txt`) and strips `%magic`/`!shell` lines.
+All three demos pass.
+
 The GitHub Actions deployment additionally builds `tvb-gdist` with the
 `rattler-build` recipe in `wasm-tests/recipes/tvb-gdist`, publishes it to a
 local channel, and installs it into the kernel env. The test runner above does
@@ -115,6 +136,11 @@ Gotchas learned the hard way:
   `wasm-tests/run.sh` patches that one flag in a private copy of
   `pyjs_runtime_browser.js` and passes it via `--pyjs-dir`. This is worth
   reporting upstream to emscripten-forge/pyjs.
+- matplotlib 3.11 changed the default `text.hinting` from `force_autohint` to
+  FreeType's native `LOAD_DEFAULT`. The emscripten-forge FreeType build has no
+  native hinter, so *any* Agg text rendering (plot titles, `tight_layout`,
+  `savefig`) fails with `RuntimeError: failed to load glyph`. Both
+  `environment.yml` and the test env therefore pin `matplotlib <3.11`.
 - The JupyterLite kernel env (`environment.yml`) installs `tvb-library` and
   `tvb-data` through the `pip:` section. `jupyterlite-xeus` runs host pip with
   `--target` and only supports pure-Python wheels, which is all tvb needs.

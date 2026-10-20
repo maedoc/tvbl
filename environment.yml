@@ -12,7 +12,11 @@ dependencies:
   - xeus-python
   - numpy
   - scipy
-  - matplotlib
+  # matplotlib 3.11 maps text.hinting="default" to FreeType's native
+  # LOAD_DEFAULT.  The emscripten-forge FreeType build cannot run the native
+  # hinter, so every Agg draw/savefig with text fails with
+  # "RuntimeError: failed to load glyph"; 3.10 defaults to force_autohint.
+  - matplotlib <3.11
   - autograd
   - tqdm
   - scikit-learn
