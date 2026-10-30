@@ -1,3 +1,4 @@
+# EXPERIMENTAL: see cde-attn-handoff.md. API is not stable.
 """Self-attention context encoders for conditional density estimation.
 
 Prototype module: a small pre-LN transformer encoder that maps a *token
@@ -228,7 +229,10 @@ class AttnEncoder:
                 zsum = kp.sum(axis=2)
                 num = qp @ state
                 den = (qp * zsum[:, :, None, :]).sum(axis=-1)
-                oh = num / den[..., None]
+                # +1e-6: _elu_plus1 can underflow to 0 in float32 for very
+                # negative pre-activations; without the guard den == 0 and
+                # the read-out is 0/0.
+                oh = num / (den + 1e-6)[..., None]
                 probs = None
                 lin = {'qp': qp, 'kp': kp, 'state': state, 'zsum': zsum,
                        'num': num, 'den': den, 'qh': qh, 'kh': kh}
@@ -302,7 +306,7 @@ class AttnEncoder:
                 L = b['lin']
                 qp, kp, state, zsum = L['qp'], L['kp'], L['state'], L['zsum']
                 num, den = L['num'], L['den']
-                inv = 1.0 / den
+                inv = 1.0 / (den + 1e-6)  # same guard as in forward
                 bar_num = bar_o * inv[..., None]
                 bar_den = -(bar_o * num * inv[..., None] ** 2).sum(axis=-1)
                 # num = qp @ state ; den = qp . zsum

@@ -130,7 +130,8 @@ class ConditionalDensityEstimator(abc.ABC):
 
     def train(self, params: np.ndarray, features: np.ndarray,
               n_iter: int = 2000, learning_rate: float = 1e-3,
-              seed: int = 0, use_tqdm: bool = True):
+              seed: int = 0, use_tqdm: bool = True,
+              batch_size: int = None, clip: float = None):
         """
         Trains the model using the Adam optimizer.
 
@@ -148,6 +149,16 @@ class ConditionalDensityEstimator(abc.ABC):
             Seed for reproducible weight initialization and training.
         use_tqdm : bool, optional
             If True, displays a progress bar during training.
+        batch_size : int, optional
+            Minibatch size per iteration.  The default ``None`` keeps the
+            historical full-batch behaviour; pass an int for minibatch Adam.
+            TODO: a fixed full-batch, fixed-lr, unclipped loop overfits or
+            diverges on SBI-scale problems (at lr=3e-3 the MAF context path
+            fails to train; without clipping it diverges to ~1e17) -- use
+            ``tvbl.sbi_eval.fit`` for minibatch + gradient clipping.
+        clip : float, optional
+            If set, gradients are scaled to this global L2 norm before the
+            Adam step.  Default ``None`` disables clipping.
         """
         # --- 1. Data Validation ---
         if params.shape[0] != features.shape[0]:
@@ -182,7 +193,12 @@ class ConditionalDensityEstimator(abc.ABC):
 
         iterator = trange(n_iter, desc="Training", disable=not use_tqdm)
         for i in iterator:
-            loss, g = self._loss_and_grad(self.weights, features, params)
+            if batch_size is None:
+                xb, yb = features, params
+            else:
+                idx = rng.randint(0, params.shape[0], batch_size)
+                xb, yb = features[idx], params[idx]
+            loss, g = self._loss_and_grad(self.weights, xb, yb)
             self.loss_history.append(loss)
 
             if not np.isfinite(loss):
@@ -198,6 +214,12 @@ class ConditionalDensityEstimator(abc.ABC):
                 if not np.all(np.isfinite(g[key])):
                     print(f"Warning: Non-finite gradient for '{key}' at iteration {i}. Stopping.")
                     return
+            if clip is not None:
+                norm = np.sqrt(sum(float((np.asarray(g[key]) ** 2).sum())
+                                   for key in self.weights))
+                if norm > clip and np.isfinite(norm):
+                    scale = clip / norm
+                    g = {key: g[key] * scale for key in self.weights}
             for key in self.weights:
                 m[key] = beta1 * m[key] + (1 - beta1) * g[key]
                 v[key] = beta2 * v[key] + (1 - beta2) * (g[key]**2)

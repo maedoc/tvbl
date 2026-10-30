@@ -352,6 +352,19 @@ def test_linear_attention_rejects_bias():
                               attn_bias=np.zeros((4, 4)), attn_type='linear')
 
 
+def test_linear_attention_large_negative_input_is_finite():
+    """elu+1 underflows to 0 in float32 for very negative pre-activations;
+    the denominator guard must keep the read-out finite (not 0/0)."""
+    est, weights = _linear_estimator()
+    tokens = np.full((2, est.n_tokens, est.token_dim), -1e4, dtype=np.float64)
+    c, _ = est.encoder.forward(weights, tokens)
+    assert np.all(np.isfinite(c))
+    tokens32 = tokens.astype(np.float32)
+    c32, _ = est.encoder.forward({k: v.astype(np.float32) for k, v in weights.items()},
+                                 tokens32)
+    assert np.all(np.isfinite(c32))
+
+
 def test_linear_attention_runs_end_to_end():
     est = attn.AttnMAFEstimator(param_dim=2, n_tokens=4, token_dim=3,
                                 d_model=8, n_heads=2, n_blocks=1, n_flows=2,
