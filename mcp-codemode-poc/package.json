@@ -1,0 +1,16 @@
+{
+  "name": "tvbl-mcp-codemode-poc",
+  "version": "1.0.0",
+  "description": "Code Mode MCP-style sandboxed Pyodide execution harness POC",
+  "main": "index.js",
+  "scripts": {
+    "start": "node src/host.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "pyodide": "^0.27.8"
+  },
+  "type": "module"
+}
