@@ -794,7 +794,8 @@ class MAFEstimator(ConditionalDensityEstimator):
                      - 0.5 * self.param_dim * np.log(2.0 * np.pi))
         return base_logp + log_det, caches
 
-    def _flow_backward_np(self, weights, caches, bar_log_prob):
+    def _flow_backward_np(self, weights, caches, bar_log_prob,
+                          compute_ctx_grad=False):
         """Pure NumPy reverse pass over the cached MAF flows.
 
         Parameters
@@ -806,6 +807,12 @@ class MAFEstimator(ConditionalDensityEstimator):
         bar_log_prob : numpy.ndarray, shape (N,)
             ``dL/dlog_prob`` for each sample. For the negative mean log
             probability loss this is ``-1/N`` per sample.
+        compute_ctx_grad : bool, optional
+            If True, also accumulate ``dL/dctx`` across flows and return it.
+            Every flow sees the *same* context vector, so the per-flow
+            adjoints add.  Needed when ``ctx`` is the output of a learned
+            encoder that must itself be trained (see
+            :class:`~tvbl.attn.AttnMAFEstimator`).
 
         Returns
         -------
@@ -813,6 +820,9 @@ class MAFEstimator(ConditionalDensityEstimator):
             Gradients for every flow, keyed exactly like ``weights``
             (``'W1y_{k}'``, ``'W1c_{k}'``, ``'b1_{k}'``, ``'W2_{k}'``,
             ``'W2c_{k}'``, ``'b2_{k}'``).
+        bar_ctx : numpy.ndarray, shape (N, C)
+            ``dL/dctx``.  Only returned when ``compute_ctx_grad`` is True
+            (otherwise the function returns ``grads`` alone, as before).
 
         Notes
         -----
@@ -834,6 +844,7 @@ class MAFEstimator(ConditionalDensityEstimator):
         np.negative(bar_u, out=bar_u)
         bar_ld = bar_logp
         grads = {}
+        bar_ctx_total = None
 
         for k in range(len(caches) - 1, -1, -1):
             c = caches[k]
@@ -850,10 +861,13 @@ class MAFEstimator(ConditionalDensityEstimator):
             np.negative(bar_alpha, out=bar_alpha)
             bar_alpha -= bar_ld[:, None]
 
-            grads_k, bar_p_net, _ = self._made_backward_np(
+            grads_k, bar_p_net, bar_ctx = self._made_backward_np(
                 weights, c['block'], k, bar_mu, bar_alpha,
-                compute_ctx_grad=False)
+                compute_ctx_grad=compute_ctx_grad)
             grads.update(grads_k)
+            if compute_ctx_grad:
+                bar_ctx_total = (bar_ctx if bar_ctx_total is None
+                                 else bar_ctx_total + bar_ctx)
 
             # Total adjoint wrt p, then scatter through p = u_in[:, perm].
             g += bar_p_net
@@ -862,6 +876,8 @@ class MAFEstimator(ConditionalDensityEstimator):
             bar_u_next[:, perm] = g
             bar_u = bar_u_next
 
+        if compute_ctx_grad:
+            return grads, bar_ctx_total
         return grads
 
     def _loss_and_grad_np(self, weights, features, params):
