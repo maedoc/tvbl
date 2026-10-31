@@ -31,10 +31,10 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import multinode as mn                                            # noqa: E402
-from benchmark import evaluate, fit, n_params                     # noqa: E402
 from jr_toy import zscore_params                                  # noqa: E402
 
 from tvbl import attn, cde                                        # noqa: E402
+from tvbl.sbi_eval import evaluate, fit, n_params                 # noqa: E402
 
 
 ARMS = ['made-raw', 'linear-pool', 'attn-1blk', 'attn-graph']

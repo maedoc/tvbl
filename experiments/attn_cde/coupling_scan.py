@@ -21,35 +21,11 @@ import sys
 from pathlib import Path
 
 import numpy as np
-from scipy.signal import periodogram
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import multinode as mn
-
-
-def features(traces, fs=1.0 / mn.DT, n_bands=10, f_max=2.0):
-    """Per-node (n, node, n_features) descriptive features."""
-    f, P = periodogram(traces.transpose(0, 2, 1), fs=fs, axis=-1)
-    keep = (f > 0.05) & (f <= f_max)
-    idx = np.where(keep)[0]
-    bands = np.array_split(idx, n_bands)
-    band_pow = np.stack([np.log10(P[:, :, b].mean(-1) + 1e-10) for b in bands], -1)
-    dom = f[idx][np.argmax(P[:, :, idx], axis=-1)]
-    cols = [traces.mean(1), traces.std(1), dom]
-    return np.concatenate([np.stack(cols, -1), band_pow], axis=-1)
-
-
-def max_corr(feat, params):
-    """(nodes, nodes) matrix of max |corr| over features: node j -> param i."""
-    n, nodes, nf = feat.shape
-    out = np.zeros((nodes, nodes))
-    for i in range(nodes):
-        for j in range(nodes):
-            c = [abs(np.corrcoef(feat[:, j, k], params[:, i])[0, 1])
-                 for k in range(nf)]
-            out[i, j] = np.nanmax(c)
-    return out
+from tvbl.sbi_eval import max_corr, trace_features
 
 
 def main(argv=None):
@@ -72,7 +48,7 @@ def main(argv=None):
             print(f"{g:>6.1f}{'':>6}{'non-finite':>32}")
             continue
         amp = tr.std(axis=1)
-        feat = features(tr)
+        feat = trace_features(tr, fs=1.0 / mn.DT)
         C = max_corr(feat, prm)
         own = np.mean(np.diag(C))
         off = C.copy()

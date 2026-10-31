@@ -352,6 +352,19 @@ def test_linear_attention_rejects_bias():
                               attn_bias=np.zeros((4, 4)), attn_type='linear')
 
 
+def test_linear_attention_large_negative_input_is_finite():
+    """elu+1 underflows to 0 in float32 for very negative pre-activations;
+    the denominator guard must keep the read-out finite (not 0/0)."""
+    est, weights = _linear_estimator()
+    tokens = np.full((2, est.n_tokens, est.token_dim), -1e4, dtype=np.float64)
+    c, _ = est.encoder.forward(weights, tokens)
+    assert np.all(np.isfinite(c))
+    tokens32 = tokens.astype(np.float32)
+    c32, _ = est.encoder.forward({k: v.astype(np.float32) for k, v in weights.items()},
+                                 tokens32)
+    assert np.all(np.isfinite(c32))
+
+
 def test_linear_attention_runs_end_to_end():
     est = attn.AttnMAFEstimator(param_dim=2, n_tokens=4, token_dim=3,
                                 d_model=8, n_heads=2, n_blocks=1, n_flows=2,
@@ -364,3 +377,99 @@ def test_linear_attention_runs_end_to_end():
     assert lp.shape == (5,) and np.all(np.isfinite(lp))
     s = est.sample(x[:2], 7, np.random.RandomState(0))
     assert s.shape == (2, 7, 2) and np.all(np.isfinite(s))
+
+
+# ---------------------------------------------------------------------------
+# Raw time-series ingest
+# ---------------------------------------------------------------------------
+
+def test_stft_tokens_shapes_multichannel():
+    rng = np.random.RandomState(0)
+    traces = rng.randn(5, 200, 3)
+    tokens, freqs = attn.stft_tokens(traces, fs=200.0, nperseg=32, hop=8)
+    # 200 samples, nperseg=32, hop=8, no padding -> 22 frames, 17 bands
+    assert tokens.shape == (5, 3 * 22, 17)
+    assert np.all(np.isfinite(tokens))
+    one, _ = attn.stft_tokens(rng.randn(4, 200), fs=200.0)
+    assert one.shape == (4, 22, 17)
+    capped, _ = attn.stft_tokens(traces, fs=200.0, f_max=20.0)
+    assert capped.shape[1] == 3 * 22 and capped.shape[2] < 17
+
+
+def test_raw_ts_estimator_ingests_traces_end_to_end():
+    """RawTSMAFEstimator takes (N, T) traces directly: train/log_prob/sample."""
+    rng = np.random.RandomState(0)
+    T = 64
+    traces = rng.randn(24, T) + 3 * np.sin(2 * np.pi * np.arange(T) / 8)
+    params = np.stack([traces.std(1), traces.mean(1)], axis=1)
+    est = attn.RawTSMAFEstimator(param_dim=2, T=T, fs=50.0, nperseg=16, hop=4,
+                                 d_model=8, n_heads=2, n_blocks=1, n_flows=2,
+                                 hidden_units=6, attn_type='linear')
+    assert est.feature_dim == est.n_tokens * est.token_dim
+    est.train(params, traces, n_iter=30, learning_rate=1e-2, seed=0,
+              use_tqdm=False, batch_size=8, clip=5.0)
+    assert len(est.loss_history) == 30
+    assert np.all(np.isfinite(est.loss_history))
+    lp = est.log_prob(traces[:4], params[:4])
+    assert lp.shape == (4,) and np.all(np.isfinite(lp))
+    s = est.sample(traces[:2], 5, np.random.RandomState(0))
+    assert s.shape == (2, 5, 2) and np.all(np.isfinite(s))
+
+
+def test_raw_ts_estimator_matches_manual_tokenisation():
+    """Training on raw traces must equal training on the same STFT tokens
+    standardised with the training-split statistics."""
+    rng = np.random.RandomState(1)
+    T = 64
+    traces = rng.randn(16, T)
+    params = rng.randn(16, 2)
+
+    def build():
+        return attn.RawTSMAFEstimator(param_dim=2, T=T, fs=50.0, nperseg=16,
+                                      hop=4, d_model=8, n_heads=2, n_blocks=1,
+                                      n_flows=2, hidden_units=6,
+                                      attn_type='linear')
+
+    est_raw = build()
+    est_raw.train(params, traces, n_iter=5, learning_rate=1e-3, seed=3,
+                  use_tqdm=False)
+    toks, _ = attn.stft_tokens(traces, fs=50.0, nperseg=16, hop=4)
+    mu, sd = est_raw._tok_mu, est_raw._tok_sd
+    est_tok = attn.AttnMAFEstimator(param_dim=2, n_tokens=est_raw.n_tokens,
+                                    token_dim=est_raw.token_dim, d_model=8,
+                                    n_heads=2, n_blocks=1, n_flows=2,
+                                    hidden_units=6, attn_type='linear')
+    est_tok.train(params, ((toks - mu) / sd).reshape(16, -1), n_iter=5,
+                  learning_rate=1e-3, seed=3, use_tqdm=False)
+    for k in est_raw.weights:
+        assert np.allclose(est_raw.weights[k], est_tok.weights[k], rtol=1e-4,
+                           atol=1e-6), k
+
+
+def test_raw_ts_estimator_works_with_sbi_eval_fit():
+    """sbi_eval.fit calls _loss_and_grad_np directly with raw traces."""
+    from . import sbi_eval
+    rng = np.random.RandomState(2)
+    T = 64
+    traces = rng.randn(24, T)
+    params = rng.randn(24, 2)
+    est = attn.RawTSMAFEstimator(param_dim=2, T=T, fs=50.0, nperseg=16, hop=4,
+                                 d_model=8, n_heads=2, n_blocks=1, n_flows=2,
+                                 hidden_units=6, attn_type='linear')
+    toks, _ = attn.stft_tokens(traces, fs=50.0, nperseg=16, hop=4)
+    est._tok_mu = toks.mean(axis=(0, 1), keepdims=True)
+    est._tok_sd = toks.std(axis=(0, 1), keepdims=True) + 1e-6
+    history, _ = sbi_eval.fit(est, traces, params, n_iter=10, batch_size=8,
+                              lr=1e-2, seed=0)
+    assert history.shape == (10,) and np.all(np.isfinite(history))
+    m = sbi_eval.evaluate(est, traces[:6], params[:6], n_posterior=8, seed=0)
+    assert np.isfinite(m['nll'])
+
+
+def test_raw_ts_estimator_rejects_wrong_trace_shape():
+    est = attn.RawTSMAFEstimator(param_dim=2, T=64, fs=50.0, nperseg=16, hop=4,
+                                 d_model=8, n_heads=2, n_blocks=1, n_flows=2,
+                                 hidden_units=6, attn_type='linear')
+    est.weights = est._initialize_weights(np.random.RandomState(0))
+    with pytest.raises(ValueError, match="tokenise to"):
+        est.log_prob(np.zeros((2, 100)), np.zeros((2, 2)))
