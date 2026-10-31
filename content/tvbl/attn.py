@@ -39,6 +39,38 @@ from .cde import ConditionalDensityEstimator, MAFEstimator
 LN_EPS = 1e-5
 
 
+def stft_tokens(traces, fs=1.0, nperseg=32, hop=8, db_floor=1e-10,
+                f_max=None):
+    """Log-power STFT tokens of raw traces, shape ``(N, n_frames, n_bands)``.
+
+    ``traces`` is ``(N, T)`` or ``(N, T, n_channels)``; channels are flattened
+    into the token axis as ``channel * n_frames + frame`` so a graph bias can
+    be built as a block matrix over channels.  With the defaults and T=200 at
+    fs=200 this gives 22 frames of 17 bands.  Pure NumPy/SciPy, so it also
+    runs under wasm.
+    """
+    from scipy.signal import stft
+
+    traces = np.asarray(traces)
+    if traces.ndim == 2:
+        traces = traces[:, :, None]
+    n, T, n_ch = traces.shape
+    flat = traces.transpose(0, 2, 1).reshape(n * n_ch, T)
+    freqs, frames, Z = stft(flat, fs=fs, nperseg=nperseg,
+                            noverlap=nperseg - hop, boundary=None,
+                            padded=False, axis=-1)
+    power = np.abs(Z) ** 2
+    if f_max is not None:
+        keep = freqs <= f_max
+        power, freqs = power[:, keep], freqs[keep]
+    lp = np.log10(power + db_floor).astype(traces.dtype if traces.dtype.kind == 'f'
+                                           else np.float32)
+    n_frames = lp.shape[2]
+    lp = lp.reshape(n, n_ch, lp.shape[1], n_frames)
+    lp = lp.transpose(0, 1, 3, 2)                    # (N, ch, frame, band)
+    return lp.reshape(n, n_ch * n_frames, lp.shape[-1]), freqs
+
+
 def _elu_plus1(x):
     """Positive feature map for linear attention: ``elu(x) + 1``.
 
@@ -437,3 +469,103 @@ class AttnMAFEstimator(ConditionalDensityEstimator):
         self._sync_flow()
         ctx, _ = self._encode(self.weights, features)
         return self.flow.sample(ctx, n_samples, rng)
+
+
+class RawTSMAFEstimator(AttnMAFEstimator):
+    """Attention CDE that ingests raw time series directly.
+
+    Same model as :class:`AttnMAFEstimator`, but ``features`` is the raw
+    simulation output ``(N, T)`` or ``(N, T, n_channels)``; the log-power
+    STFT tokenisation (:func:`stft_tokens`) happens inside, so callers never
+    pre-tokenise::
+
+        est = RawTSMAFEstimator(param_dim=2, T=200, n_channels=1, fs=200.0)
+        est.train(params, traces, n_iter=3000)          # traces: (N, 200)
+        post = est.sample(traces[:5], 256, rng)         # posteriors over params
+
+    Token statistics (per-band mean/std of the log-power STFT) are computed
+    on the training split inside :meth:`train` and applied to any later
+    input, so train and test see identical scaling.
+
+    Parameters
+    ----------
+    T : int
+        Number of time samples per simulation.
+    n_channels : int
+        Number of channels (e.g. nodes); flattened into the token axis.
+    fs, nperseg, hop, db_floor, f_max : optional
+        STFT settings, see :func:`stft_tokens`.
+    Plus all :class:`AttnMAFEstimator` parameters.
+    """
+
+    def __init__(self, param_dim: int, T: int, n_channels: int = 1, fs: float = 1.0,
+                 nperseg: int = 32, hop: int = 8, db_floor: float = 1e-10,
+                 f_max: float = None, **kwargs):
+        self.T = T
+        self.n_channels = n_channels
+        self.fs, self.nperseg, self.hop = fs, nperseg, hop
+        self.db_floor, self.f_max = db_floor, f_max
+        # Token shape is fixed by the STFT geometry; compute it once on a
+        # dummy signal so feature_dim is known before any data arrives.
+        dummy = np.zeros((1, T, n_channels), dtype=np.float64)
+        tokens, _ = stft_tokens(dummy, fs=fs, nperseg=nperseg, hop=hop,
+                                db_floor=db_floor, f_max=f_max)
+        n_tokens, token_dim = tokens.shape[1], tokens.shape[2]
+        super().__init__(param_dim=param_dim, n_tokens=n_tokens,
+                         token_dim=token_dim, **kwargs)
+        self._tok_mu = None
+        self._tok_sd = None
+
+    def _raw_to_tokens(self, traces):
+        tokens, _ = stft_tokens(traces, fs=self.fs, nperseg=self.nperseg,
+                                hop=self.hop, db_floor=self.db_floor,
+                                f_max=self.f_max)
+        if tokens.shape[1:] != (self.n_tokens, self.token_dim):
+            raise ValueError(
+                f"traces {np.asarray(traces).shape} tokenise to "
+                f"{tokens.shape[1:]}, expected {(self.n_tokens, self.token_dim)}; "
+                f"check T/n_channels/nperseg/hop")
+        if self._tok_mu is not None:
+            tokens = (tokens - self._tok_mu) / self._tok_sd
+        return tokens
+
+    def _features(self, traces):
+        traces = np.asarray(traces)
+        # Idempotent: input already flattened to (N, n_tokens * token_dim)
+        # (e.g. from train(), which pre-tokenises for base-class validation)
+        # is passed through unchanged.
+        if traces.ndim == 2 and traces.shape[1] == self.n_tokens * self.token_dim:
+            return traces
+        tokens = self._raw_to_tokens(traces)
+        return tokens.reshape(tokens.shape[0], -1)
+
+    # sbi_eval.fit and the base train() call these directly with whatever
+    # ``features`` they were given, so the raw->token map must happen here too.
+    def _loss_and_grad_np(self, weights, features, params):
+        return super()._loss_and_grad_np(weights, self._features(features), params)
+
+    def _loss_and_grad(self, weights, features, params):
+        return super()._loss_and_grad(weights, self._features(features), params)
+
+    def _loss_function(self, weights, features, params):
+        return super()._loss_function(weights, self._features(features), params)
+
+    def train(self, params, features, **kwargs):
+        # Compute token statistics on the unstandardised tokens of this
+        # training split, then standardise; _raw_to_tokens applies the stored
+        # statistics to any later input.
+        self._tok_mu = None
+        raw_tokens = self._raw_to_tokens(features)
+        self._tok_mu = raw_tokens.mean(axis=(0, 1), keepdims=True)
+        self._tok_sd = raw_tokens.std(axis=(0, 1), keepdims=True) + 1e-6
+        # Base train() validates on the flat token width, so feed it the
+        # standardised tokens; its inner _loss_and_grad re-maps them through
+        # _features, which is idempotent on already-tokenised input.
+        flat = self._raw_to_tokens(features).reshape(features.shape[0], -1)
+        super().train(params, flat, **kwargs)
+
+    def log_prob(self, features, params):
+        return super().log_prob(self._features(features), params)
+
+    def sample(self, features, n_samples, rng):
+        return super().sample(self._features(features), n_samples, rng)
