@@ -62,6 +62,19 @@ jobs:
           Path("environment.ci.yml").write_text("\n".join(out) + "\n")
           PY
 
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Build the MCP hub JupyterLite extension
+        shell: bash -l {0}
+        run: |
+          cd mcp-hub-extension
+          jlpm install --immutable
+          jlpm build
+          ls -R ../extensions/@tvbl/jupyterlite-mcp-hub | head -20
+
       - name: Build the JupyterLite site
         shell: bash -l {0}
         run: |

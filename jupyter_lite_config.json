@@ -1,0 +1,5 @@
+{
+  "FederatedExtensionAddon": {
+    "extra_labextensions_path": ["extensions"]
+  }
+}

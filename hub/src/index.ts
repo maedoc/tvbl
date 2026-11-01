@@ -40,8 +40,12 @@ export default {
       return json({ ok: true, now: Date.now(), service: "tvbl-mcp-hub" });
     }
 
+    if (url.pathname === "/pair" && request.method === "OPTIONS") {
+      return withCors(new Response(null, { status: 204 }));
+    }
+
     if (url.pathname === "/pair" && request.method === "POST") {
-      return createPair(request, env);
+      return withCors(await createPair(request, env));
     }
 
     if (url.pathname === "/run") {
@@ -533,6 +537,19 @@ function randomHex(bytes: number): string {
   const b = new Uint8Array(bytes);
   crypto.getRandomValues(b);
   return [...b].map(x => x.toString(16).padStart(2, "0")).join("");
+}
+
+function withCors(response: Response): Response {
+  const headers = new Headers(response.headers);
+  headers.set("access-control-allow-origin", "*");
+  headers.set("access-control-allow-methods", "POST, OPTIONS");
+  headers.set("access-control-allow-headers", "content-type");
+  headers.set("access-control-max-age", "86400");
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
 }
 
 function json(data: unknown, status = 200): Response {

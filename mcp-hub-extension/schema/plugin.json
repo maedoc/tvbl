@@ -1,0 +1,47 @@
+{
+  "title": "MCP Hub",
+  "description": "Expose this JupyterLite tab to an MCP hub so chat clients (ChatGPT, Claude, Gemini, …) can create and run notebook cells here. Pair once from the MCP Hub panel.",
+  "type": "object",
+  "properties": {
+    "hubUrl": {
+      "title": "Hub URL",
+      "description": "Base URL of the Cloudflare Worker hub.",
+      "type": "string",
+      "default": "https://tvbl-mcp-hub.marmaduke-woodman.workers.dev"
+    },
+    "pairId": {
+      "title": "Pair ID",
+      "description": "Set by the Pair button; identifies this tab's Durable Object.",
+      "type": "string",
+      "default": ""
+    },
+    "pairToken": {
+      "title": "Pair token",
+      "description": "Set by the Pair button; authenticates this tab as the runner for the pair.",
+      "type": "string",
+      "default": ""
+    },
+    "autoConnect": {
+      "title": "Connect on startup",
+      "description": "Reconnect automatically when JupyterLite loads.",
+      "type": "boolean",
+      "default": true
+    },
+    "logLimit": {
+      "title": "Activity log entries",
+      "type": "integer",
+      "default": 200,
+      "minimum": 20,
+      "maximum": 2000
+    },
+    "maxImageBytes": {
+      "title": "Maximum image size",
+      "description": "PNG output above this size is downscaled before being sent to the chat client.",
+      "type": "integer",
+      "default": 200000,
+      "minimum": 10000,
+      "maximum": 2000000
+    }
+  },
+  "additionalProperties": false
+}

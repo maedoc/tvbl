@@ -131,3 +131,9 @@ hub/.wrangler/
 hub/.dev.vars
 .cf-tvbl.env
 *.env
+
+# jupyterlite mcp hub extension (source lives in mcp-hub-extension/)
+mcp-hub-extension/.yarn/
+mcp-hub-extension/lib/
+mcp-hub-extension/tsconfig.tsbuildinfo
+extensions/@tvbl/

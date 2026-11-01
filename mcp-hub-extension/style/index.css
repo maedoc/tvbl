@@ -1,0 +1,160 @@
+.tvbl-mcp-panel {
+  min-width: 320px;
+  color: var(--jp-ui-font-color1);
+  background: var(--jp-layout-color1);
+  font-size: var(--jp-ui-font-size1);
+}
+
+.tvbl-mcp-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  overflow-y: auto;
+}
+
+.tvbl-mcp-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.tvbl-mcp-status-row {
+  font-weight: 600;
+}
+
+.tvbl-mcp-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+  background: var(--jp-error-color1);
+}
+
+.tvbl-mcp-dot.tvbl-mcp-connected {
+  background: var(--jp-success-color1, #2e7d32);
+  box-shadow: 0 0 6px var(--jp-success-color1, #2e7d32);
+}
+
+.tvbl-mcp-dot.tvbl-mcp-connecting {
+  background: var(--jp-warn-color1, #f9a825);
+  animation: tvbl-mcp-pulse 1s infinite;
+}
+
+.tvbl-mcp-dot.tvbl-mcp-offline {
+  background: var(--jp-error-color1, #c62828);
+}
+
+@keyframes tvbl-mcp-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+.tvbl-mcp-detail {
+  color: var(--jp-ui-font-color2);
+  font-size: var(--jp-ui-font-size0);
+  line-height: 1.4;
+  word-break: break-word;
+}
+
+.tvbl-mcp-label {
+  margin-top: 6px;
+  font-size: var(--jp-ui-font-size0);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--jp-ui-font-color2);
+}
+
+.tvbl-mcp-huburl {
+  font-size: var(--jp-ui-font-size0);
+  color: var(--jp-ui-font-color2);
+  word-break: break-all;
+}
+
+.tvbl-mcp-button {
+  border: 1px solid var(--jp-border-color1);
+  background: var(--jp-layout-color2);
+  color: var(--jp-ui-font-color1);
+  border-radius: 4px;
+  padding: 4px 10px;
+  cursor: pointer;
+  font-size: var(--jp-ui-font-size1);
+}
+
+.tvbl-mcp-button:hover:not(:disabled) {
+  background: var(--jp-layout-color3);
+}
+
+.tvbl-mcp-button:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.tvbl-mcp-mcpurl {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 5px 6px;
+  border: 1px solid var(--jp-border-color1);
+  border-radius: 4px;
+  background: var(--jp-input-active-background, var(--jp-layout-color0));
+  color: var(--jp-ui-font-color1);
+  font-family: var(--jp-code-font-family);
+  font-size: 11px;
+}
+
+.tvbl-mcp-hint {
+  color: var(--jp-ui-font-color2);
+  font-size: var(--jp-ui-font-size0);
+  line-height: 1.45;
+}
+
+.tvbl-mcp-log {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 45vh;
+  overflow-y: auto;
+  border: 1px solid var(--jp-border-color2);
+  border-radius: 4px;
+  padding: 6px;
+  background: var(--jp-layout-color0);
+  font-family: var(--jp-code-font-family);
+  font-size: 11px;
+}
+
+.tvbl-mcp-entry {
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--jp-ui-font-color2);
+}
+
+.tvbl-mcp-entry.tvbl-mcp-job {
+  color: var(--jp-ui-font-color1);
+}
+
+.tvbl-mcp-entry.tvbl-mcp-ok {
+  color: var(--jp-success-color1, #2e7d32);
+}
+
+.tvbl-mcp-entry.tvbl-mcp-error {
+  color: var(--jp-error-color1, #c62828);
+}
+
+.tvbl-mcp-statusbar {
+  padding: 0 10px;
+  font-size: var(--jp-ui-font-size0);
+  color: var(--jp-ui-font-color2);
+}
+
+.tvbl-mcp-statusbar.tvbl-mcp-connected {
+  color: var(--jp-success-color1, #2e7d32);
+}
+
+.tvbl-mcp-statusbar.tvbl-mcp-connecting {
+  color: var(--jp-warn-color1, #f9a825);
+}
