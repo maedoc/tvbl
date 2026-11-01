@@ -15,9 +15,16 @@ export interface Env {
 
 export const JOB_TTL_MS = 60 * 60 * 1000;
 export const JOB_STALE_MS = 15 * 60 * 1000;
+export const IDEM_TTL_MS = 10 * 60 * 1000;
 const MAX_KEPT_JOBS = 200;
 
 export type JobStatus = "queued" | "running" | "ok" | "error" | "cancelled";
+
+export interface JobError {
+  code: string;
+  message: string;
+  hint?: string;
+}
 
 export interface JobRecord {
   id: string;
@@ -28,7 +35,7 @@ export interface JobRecord {
   updatedAt: number;
   content?: unknown;
   structured?: unknown;
-  error?: string;
+  error?: JobError;
 }
 
 interface PairRecord {
@@ -37,9 +44,21 @@ interface PairRecord {
   label?: string;
 }
 
+interface IdemRecord {
+  jobId: string;
+  at: number;
+}
+
 type RunnerFrame =
   | { type: "auth"; token: string; label?: string }
-  | { type: "result"; id: string; ok: boolean; content?: unknown; structured?: unknown; error?: string }
+  | {
+      type: "result";
+      id: string;
+      ok: boolean;
+      content?: unknown;
+      structured?: unknown;
+      error?: JobError | string;
+    }
   | { type: "progress"; id: string; message?: string };
 
 interface Attachment {
@@ -58,6 +77,18 @@ export function safeEqual(a: string, b: string): boolean {
   let out = 0;
   for (let i = 0; i < a.length; i++) out |= a.charCodeAt(i) ^ b.charCodeAt(i);
   return out === 0;
+}
+
+export function normalizeJobError(err: unknown): JobError {
+  if (err && typeof err === "object") {
+    const e = err as Record<string, unknown>;
+    return {
+      code: typeof e.code === "string" ? e.code : "error",
+      message: typeof e.message === "string" ? e.message : "error",
+      hint: typeof e.hint === "string" ? e.hint : undefined,
+    };
+  }
+  return { code: "error", message: typeof err === "string" ? err : "error" };
 }
 
 function json(data: unknown, status = 200): Response {
@@ -169,11 +200,22 @@ export class RunnerHub extends DurableObject<Env> {
   // ── jobs ─────────────────────────────────────────────────────────
 
   private async call(request: Request): Promise<Response> {
-    const { kind, args, waitMs } = (await request.json()) as {
+    const { kind, args, waitMs, idempotencyKey } = (await request.json()) as {
       kind: string;
       args: unknown;
       waitMs?: number;
+      idempotencyKey?: string;
     };
+
+    const idemKey = idempotencyKey ? `idem:${kind}:${idempotencyKey}` : null;
+
+    if (idemKey) {
+      const prior = await this.ctx.storage.get<IdemRecord>(idemKey);
+      if (prior && Date.now() - prior.at < IDEM_TTL_MS) {
+        const existing = await this.ctx.storage.get<JobRecord>(`job:${prior.jobId}`);
+        if (existing) return this.awaitJob(existing, waitMs);
+      }
+    }
 
     const runners = this.runners();
     if (runners.length === 0) return json({ status: "offline" });
@@ -189,17 +231,31 @@ export class RunnerHub extends DurableObject<Env> {
       updatedAt: now,
     };
     await this.ctx.storage.put(`job:${id}`, job);
+    if (idemKey) await this.ctx.storage.put<IdemRecord>(idemKey, { jobId: id, at: now });
 
     const wait = waitMs && waitMs > 0 ? this.waitFor(id, waitMs) : Promise.resolve(null);
     const sent = this.send(runners, { type: "job", id, kind, args });
     if (!sent) {
-      await this.ctx.storage.put(`job:${id}`, { ...job, status: "error", error: "runner unreachable" });
+      const failed: JobRecord = {
+        ...job,
+        status: "error",
+        error: { code: "runner_unreachable", message: "the runner socket closed before the job was sent" },
+      };
+      await this.ctx.storage.put(`job:${id}`, failed);
       return json({ status: "offline" });
     }
 
     const done = await wait;
     if (!done) return json({ status: "running", jobId: id });
     return json(toRelay(done));
+  }
+
+  private async awaitJob(job: JobRecord, waitMs?: number): Promise<Response> {
+    if (job.status === "ok" || job.status === "error" || job.status === "cancelled") {
+      return json(toRelay(job));
+    }
+    const done = waitMs && waitMs > 0 ? await this.waitFor(job.id, waitMs) : null;
+    return json(done ? toRelay(done) : { status: "running", jobId: job.id });
   }
 
   private send(runners: Array<{ ws: WebSocket }>, frame: unknown): boolean {
@@ -229,15 +285,23 @@ export class RunnerHub extends DurableObject<Env> {
   }
 
   private async job(id: string): Promise<Response> {
-    if (!id) return json({ status: "error", error: "missing job id" }, 400);
+    if (!id) {
+      return json({ status: "error", error: { code: "invalid_argument", message: "missing job_id" } }, 400);
+    }
     const job = await this.ctx.storage.get<JobRecord>(`job:${id}`);
-    if (!job) return json({ status: "error", error: "unknown job id" }, 404);
+    if (!job) {
+      return json({ status: "error", error: { code: "job_unknown", message: `unknown job_id: ${id}` } }, 404);
+    }
     if (
       (job.status === "running" || job.status === "queued") &&
       Date.now() - job.createdAt > JOB_STALE_MS
     ) {
       job.status = "error";
-      job.error = "runner never reported completion (tab closed or kernel wedged?)";
+      job.error = {
+        code: "job_stale",
+        message: "the runner never reported completion (tab closed or kernel wedged?)",
+        hint: "call kernel_restart and re-run the cell",
+      };
       job.updatedAt = Date.now();
       await this.ctx.storage.put(`job:${id}`, job);
     }
@@ -248,14 +312,20 @@ export class RunnerHub extends DurableObject<Env> {
     const { id } = (await request.json()) as { id: string };
     const key = `job:${id}`;
     const job = await this.ctx.storage.get<JobRecord>(key);
-    if (!job) return json({ ok: false, error: "unknown job id" }, 404);
+    if (!job) {
+      return json({ ok: false, error: { code: "job_unknown", message: `unknown job_id: ${id}` } }, 404);
+    }
     job.status = "cancelled";
+    job.error = {
+      code: "cancelled",
+      message: "the job was cancelled; the cell may still be computing in the browser",
+    };
     job.updatedAt = Date.now();
     await this.ctx.storage.put(key, job);
     this.send(this.runners(), { type: "cancel", id });
     this.waiters.get(id)?.(job);
     this.waiters.delete(id);
-    return json({ ok: true });
+    return json({ ok: true, status: "cancelled", jobId: id });
   }
 
   // ── socket handlers (hibernation API) ────────────────────────────
@@ -304,7 +374,7 @@ export class RunnerHub extends DurableObject<Env> {
     job.status = frame.ok ? "ok" : "error";
     job.content = frame.content;
     job.structured = frame.structured;
-    job.error = frame.ok ? undefined : (frame.error ?? "runner error");
+    job.error = frame.ok ? undefined : normalizeJobError(frame.error);
     job.updatedAt = Date.now();
     await this.ctx.storage.put(key, job);
 
@@ -342,12 +412,24 @@ export class RunnerHub extends DurableObject<Env> {
       const tooOld = Date.now() - job.createdAt > JOB_TTL_MS;
       if (tooOld || i >= MAX_KEPT_JOBS) await this.ctx.storage.delete(key);
     }
+
+    const idem = await this.ctx.storage.list<IdemRecord>({ prefix: "idem:" });
+    for (const [key, rec] of idem) {
+      if (Date.now() - rec.at > IDEM_TTL_MS) await this.ctx.storage.delete(key);
+    }
   }
 }
 
 export function toRelay(job: JobRecord): Record<string, unknown> {
   return {
-    status: job.status === "ok" ? "ok" : job.status === "cancelled" ? "cancelled" : job.status === "error" ? "error" : "running",
+    status:
+      job.status === "ok"
+        ? "ok"
+        : job.status === "cancelled"
+          ? "cancelled"
+          : job.status === "error"
+            ? "error"
+            : "running",
     jobId: job.id,
     kind: job.kind,
     content: job.content,

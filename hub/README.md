@@ -94,3 +94,20 @@ return a `job_id` if the cell is still running.
 - No `notifications/progress` yet: long calls hold the SSE stream open silently
   and `job_result` is the polling path.
 - One runner tab per pair; the most recently active authenticated socket wins.
+
+## Result contract
+
+| outcome | `isError` | `structuredContent` |
+| --- | --- | --- |
+| success | `false` | `{ok:true, job_id, ...runner structured}` |
+| still running | `false` | `{ok:true, status:"running", job_id}` |
+| failure | `true` | `{ok:false, error:{code, message, hint?}}` |
+
+Errors never carry `job_id` or `status`, so a client only has to look at
+`isError`/`ok`. Stable codes: `runner_offline`, `invalid_argument`,
+`no_notebook`, `unknown_cell`, `not_found`, `already_exists`, `kernel_failed`,
+`execution_error`, `job_unknown`, `job_stale`, `cancelled`, `tool_error`.
+
+Mutating tools accept an optional `idempotency_key`; a retry with the same key
+within 10 minutes returns the original job instead of executing again (the DO
+stores `idem:<kind>:<key> -> job id`).

@@ -11,11 +11,17 @@ export interface ImageContent {
 
 export type Content = TextContent | ImageContent;
 
+export interface JobError {
+  code: string;
+  message: string;
+  hint?: string;
+}
+
 export interface JobResult {
   ok: boolean;
   content: Content[];
   structured?: Record<string, unknown>;
-  error?: string;
+  error?: JobError;
 }
 
 export interface JobFrame {

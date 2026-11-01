@@ -3,9 +3,16 @@ import type { Content } from './types';
 
 const ANSI = /\u001b\[[0-9;]*[A-Za-z]/g;
 
+export interface CollectedImage {
+  data: string;
+  mimeType: string;
+  bytes: number;
+}
+
 export interface CollectedOutputs {
   content: Content[];
   raw: unknown[];
+  images: CollectedImage[];
   hasError: boolean;
   errorText?: string;
 }
@@ -21,13 +28,14 @@ export async function collectOutputs(
   maxText = 12_000,
 ): Promise<CollectedOutputs> {
   if (cell.model.type !== 'code') {
-    return { content: [], raw: [], hasError: false };
+    return { content: [], raw: [], images: [], hasError: false };
   }
 
   const model = cell.model as ICodeCellModel;
   const raw = model.outputs.toJSON();
   const textParts: string[] = [];
   const images: Content[] = [];
+  const collectedImages: CollectedImage[] = [];
   const errors: string[] = [];
   const maxB64 = Math.floor(maxImageBytes * 1.37);
 
@@ -59,6 +67,11 @@ export async function collectOutputs(
         const shrunk = await shrinkImage(png ?? jpeg!, maxB64);
         if (shrunk) {
           images.push({ type: 'image', data: shrunk, mimeType });
+          collectedImages.push({
+            data: shrunk,
+            mimeType,
+            bytes: Math.floor((shrunk.length * 3) / 4),
+          });
         } else {
           textParts.push(`[image omitted: exceeds ${maxImageBytes} bytes]`);
         }
@@ -87,16 +100,19 @@ export async function collectOutputs(
   if (content.length === 0) {
     content.push({ type: 'text', text: '(no output)' });
   }
-
   return {
     content,
     raw: sanitizeOutputs(raw),
+    images: collectedImages,
     hasError,
     errorText: hasError ? errors.join('; ') : undefined,
   };
 }
 
-/** Strip base64 payloads so `structuredContent` stays readable. */
+/**
+ * Strip base64 payloads so `structuredContent` stays readable. Image entries
+ * become explicit pointers, never silent placeholders.
+ */
 export function sanitizeOutputs(raw: unknown[]): unknown[] {
   const walk = (value: unknown): unknown => {
     if (typeof value === 'string') {
@@ -108,7 +124,17 @@ export function sanitizeOutputs(raw: unknown[]): unknown[] {
     if (value && typeof value === 'object') {
       const out: Record<string, unknown> = {};
       for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-        out[k] = /^image\//.test(k) ? `<image ${typeof v === 'string' ? v.length : '?'} chars>` : walk(v);
+        if (/^image\//.test(k)) {
+          const chars = typeof v === 'string' ? v.length : 0;
+          out[k] = {
+            omitted: true,
+            mimeType: k,
+            bytes: Math.floor((chars * 3) / 4),
+            note: 'delivered as an MCP image content block; call notebook_figures for a text summary',
+          };
+        } else {
+          out[k] = walk(v);
+        }
       }
       return out;
     }

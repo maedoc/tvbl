@@ -8,10 +8,21 @@ import type { INotebookTracker } from '@jupyterlab/notebook';
 import type { Contents } from '@jupyterlab/services';
 import type { ITranslator } from '@jupyterlab/translation';
 
-import { collectOutputs, sanitizeOutputs } from './output';
+import { collectOutputs, sanitizeOutputs, type CollectedImage } from './output';
 import type { JobFrame, JobResult } from './types';
 
 const SOURCE_CLIP = 6_000;
+const OUTPUT_CLIP = 12_000;
+
+class ToolError extends Error {
+  constructor(
+    readonly code: string,
+    message: string,
+    readonly hint?: string,
+  ) {
+    super(message);
+  }
+}
 
 /**
  * Executes hub jobs against real JupyterLab APIs: the notebook model for
@@ -30,6 +41,18 @@ export class ToolDispatcher {
   ) {}
 
   async dispatch(frame: JobFrame): Promise<JobResult> {
+    try {
+      return await this.run(frame);
+    } catch (err) {
+      if (err instanceof ToolError) {
+        return fail(err.code, err.message, err.hint);
+      }
+      console.error('mcp-hub: unhandled tool error', err);
+      return fail('tool_error', messageOf(err), 'this is a runner bug; check the browser console');
+    }
+  }
+
+  private async run(frame: JobFrame): Promise<JobResult> {
     const args = (frame.args ?? {}) as Record<string, unknown>;
     switch (frame.kind) {
       case 'site_info':
@@ -54,6 +77,8 @@ export class ToolDispatcher {
         return this.cellRun(args);
       case 'notebook_run_all':
         return this.notebookRunAll(args);
+      case 'notebook_figures':
+        return this.notebookFigures();
       case 'kernel_restart':
         return this.kernelRestart();
       case 'file_list':
@@ -63,7 +88,7 @@ export class ToolDispatcher {
       case 'file_write':
         return this.fileWrite(args);
       default:
-        return fail(`unknown job kind: ${frame.kind}`);
+        return fail('unknown_tool', `unknown job kind: ${frame.kind}`, 'this hub is newer than the runner; reload the page');
     }
   }
 
@@ -73,12 +98,14 @@ export class ToolDispatcher {
     const panel = this.tracker.currentWidget;
     const session = panel?.sessionContext;
     const specs = this.app.serviceManager.kernelspecs.specs;
+    const kernels = specs ? Object.keys(specs.kernelspecs) : [];
     const info = {
       notebook: panel?.context.path ?? null,
       cells: panel?.content.model?.cells.length ?? 0,
       kernel: session?.session?.kernel?.name ?? null,
       kernel_status: session?.kernelDisplayStatus ?? 'none',
       default_kernel: specs?.default ?? null,
+      kernels,
       app: PageConfig.getOption('appName') || 'JupyterLite',
       app_version: PageConfig.getOption('appVersion') || null,
     };
@@ -86,7 +113,8 @@ export class ToolDispatcher {
       `notebook: ${info.notebook ?? '(none open)'}`,
       `cells: ${info.cells}`,
       `kernel: ${info.kernel ?? '(not started)'} (${info.kernel_status})`,
-      `default kernel: ${info.default_kernel ?? '(unknown)'}`,
+      `default_kernel: ${info.default_kernel ?? '(unknown)'}`,
+      `kernels: ${kernels.join(', ') || '(none)'}`,
       `${info.app} ${info.app_version ?? ''}`.trim(),
     ];
     return ok(lines.join('\n'), info);
@@ -109,34 +137,48 @@ export class ToolDispatcher {
     const panel = this.panel(args.path);
     if (!panel) {
       return fail(
-        typeof args.path === 'string'
-          ? `notebook not open: ${args.path}`
-          : 'no notebook open; call notebook_create first',
+        'no_notebook',
+        typeof args.path === 'string' ? `notebook not open: ${args.path}` : 'no notebook is open',
+        'call notebook_open or notebook_create first',
       );
     }
     const includeOutputs = args.include_outputs !== false;
+    const maxCell = typeof args.max_cell_chars === 'number' ? args.max_cell_chars : SOURCE_CLIP;
     const model = panel.content.model;
     if (!model) {
-      return fail('notebook has no model');
+      return fail('not_found', 'the notebook has no model');
     }
 
     const cells = [];
+    let anyTruncated = false;
     for (let i = 0; i < model.cells.length; i++) {
       const cell = model.cells.get(i);
       const code = cell.type === 'code' ? (cell as ICodeCellModel) : null;
-      const outputs = includeOutputs && code ? sanitizeOutputs(code.outputs.toJSON()) : null;
+      const source = cell.sharedModel.getSource();
+      const clipped = clip(source, maxCell);
+      if (clipped.length !== source.length) {
+        anyTruncated = true;
+      }
       cells.push({
         cell_id: cell.id,
         index: i,
         type: cell.type,
-        source: clip(cell.sharedModel.getSource(), SOURCE_CLIP),
+        source: clipped,
+        source_chars: source.length,
+        source_truncated: clipped.length !== source.length,
         execution_count: code?.executionCount ?? null,
         execution_state: code?.executionState ?? null,
-        ...(outputs ? { outputs } : {}),
+        ...(includeOutputs && code
+          ? { outputs: sanitizeOutputs(code.outputs.toJSON()) }
+          : {}),
       });
     }
 
-    const summary = [`${panel.context.path}: ${cells.length} cells`]
+    const summary = [
+      `${panel.context.path}: ${cells.length} cells` +
+        (includeOutputs ? '' : ' (outputs omitted)') +
+        (anyTruncated ? ` (sources capped at ${maxCell} chars)` : ''),
+    ]
       .concat(
         cells.map(c => {
           const first = c.source.split('\n')[0]?.slice(0, 70) ?? '';
@@ -150,6 +192,7 @@ export class ToolDispatcher {
       path: panel.context.path,
       kernel: panel.sessionContext.session?.kernel?.name ?? null,
       cells,
+      truncated: anyTruncated,
     });
   }
 
@@ -158,11 +201,32 @@ export class ToolDispatcher {
     const requested = typeof args.path === 'string' ? args.path : null;
     const spec = this.kernelSpec(typeof args.kernel === 'string' ? args.kernel : undefined);
 
-    if (requested) {
-      const exists = await this.exists(requested);
-      if (exists) {
-        return fail(`notebook already exists: ${requested}; use notebook_open`);
+    if (requested && (await this.exists(requested))) {
+      if (args.if_exists === 'error') {
+        return fail(
+          'already_exists',
+          `notebook already exists: ${requested}`,
+          'call notebook_open to use it, or pass if_exists="open"',
+        );
       }
+      const widget = this.docManager.openOrReveal(requested);
+      if (!(widget instanceof NotebookPanel)) {
+        return fail('not_found', `could not open existing notebook ${requested}`);
+      }
+      this.app.shell.activateById(widget.id);
+      await widget.context.ready;
+      await this.ensureKernel(widget);
+      const first = widget.content.model?.cells.get(0);
+      return ok(`opened existing ${requested} (created: false)`, {
+        path: requested,
+        created: false,
+        opened: true,
+        cell_id: first?.id ?? null,
+        kernel: widget.sessionContext.session?.kernel?.name ?? null,
+      });
+    }
+
+    if (requested) {
       const notebook = {
         cells: [],
         metadata: {
@@ -176,7 +240,7 @@ export class ToolDispatcher {
       await this.contents.save(requested, { type: 'notebook', format: 'json', content: notebook });
       const widget = this.docManager.open(requested, undefined, { name: spec.name });
       if (!(widget instanceof NotebookPanel)) {
-        return fail(`opened ${requested} but it is not a notebook`);
+        return fail('not_found', `opened ${requested} but it is not a notebook`);
       }
       this.app.shell.activateById(widget.id);
       await widget.context.ready;
@@ -187,6 +251,8 @@ export class ToolDispatcher {
           `write into it with cell_edit or add more with cell_insert`,
         {
           path: requested,
+          created: true,
+          opened: true,
           kernel: widget.sessionContext.session?.kernel?.name ?? spec.name,
           cell_id: first?.id ?? null,
         },
@@ -199,12 +265,14 @@ export class ToolDispatcher {
     );
     const panel = this.tracker.currentWidget;
     if (!panel) {
-      return fail('notebook:create-new did not create a notebook');
+      return fail('not_found', 'notebook:create-new did not create a notebook');
     }
     await panel.context.ready;
     await this.ensureKernel(panel);
     return ok(`created and opened ${panel.context.path}`, {
       path: panel.context.path,
+      created: true,
+      opened: true,
       kernel: panel.sessionContext.session?.kernel?.name ?? null,
     });
   }
@@ -212,18 +280,18 @@ export class ToolDispatcher {
   private async notebookOpen(args: Record<string, unknown>): Promise<JobResult> {
     const path = String(args.path ?? '');
     if (!path) {
-      return fail('missing path');
+      return fail('invalid_argument', 'missing path', 'pass the notebook path, e.g. "demo.ipynb"');
     }
     const widget = this.docManager.openOrReveal(path);
     if (!widget) {
-      return fail(`could not open ${path}`);
+      return fail('not_found', `could not open ${path}`, 'call notebook_list to see available paths');
     }
     this.app.shell.activateById(widget.id);
     await widget.context.ready;
     if (widget instanceof NotebookPanel) {
       await this.ensureKernel(widget);
     }
-    return ok(`opened ${path}`);
+    return ok(`opened ${path}`, { path, opened: true });
   }
 
   // ── cell editing ────────────────────────────────────────────────
@@ -232,7 +300,7 @@ export class ToolDispatcher {
     const panel = this.requirePanel(args.notebook);
     const model = panel.content.model;
     if (!model) {
-      return fail('notebook has no model');
+      return fail('not_found', 'the notebook has no model');
     }
     const type = args.cell_type === 'markdown' ? 'markdown' : 'code';
     const source = String(args.source ?? '');
@@ -300,7 +368,7 @@ export class ToolDispatcher {
     const cell = this.findCell(panel, args.cell_id);
     const model = panel.content.model;
     if (!model) {
-      return fail('notebook has no model');
+      return fail('not_found', 'the notebook has no model');
     }
     const from = panel.content.widgets.indexOf(cell);
     const to = Math.max(0, Math.min(Number(args.index ?? 0), model.cells.length - 1));
@@ -319,7 +387,7 @@ export class ToolDispatcher {
     try {
       await this.ensureKernel(panel);
     } catch (err) {
-      return fail(`kernel not available: ${messageOf(err)}`);
+      return fail('kernel_failed', `kernel not available: ${messageOf(err)}`, 'call kernel_restart');
     }
 
     panel.content.activeCellIndex = panel.content.widgets.indexOf(cell);
@@ -339,26 +407,41 @@ export class ToolDispatcher {
       thrown = messageOf(err);
     }
 
-    const collected = await collectOutputs(cell, this.maxImageBytes);
+    const collected = await collectOutputs(cell, this.maxImageBytes, OUTPUT_CLIP);
+    const images = await this.saveImages(panel, cell.model.id, collected.images);
     const duration = Math.round(performance.now() - started);
     const code = cell.model.type === 'code' ? (cell.model as ICodeCellModel) : null;
     const content = [...collected.content];
+    if (images.length) {
+      content.push({
+        type: 'text',
+        text: `[figures saved: ${images.map(i => i.path).join(', ')}]`,
+      });
+    }
     if (thrown && !collected.hasError) {
       content.unshift({ type: 'text', text: `execution failed: ${thrown}` });
     }
 
     this.persist(panel);
 
+    const failed = !returned || Boolean(thrown) || collected.hasError;
     return {
-      ok: returned && !thrown && !collected.hasError,
+      ok: !failed,
       content,
       structured: {
         cell_id: cell.model.id,
         duration_ms: duration,
         execution_count: code?.executionCount ?? null,
         outputs: collected.raw,
+        images,
       },
-      error: collected.errorText ?? thrown,
+      error: failed
+        ? {
+            code: 'execution_error',
+            message: collected.errorText ?? thrown ?? 'the cell did not complete successfully',
+            hint: 'the full traceback is in the cell output shown in the notebook',
+          }
+        : undefined,
     };
   }
 
@@ -368,7 +451,7 @@ export class ToolDispatcher {
     try {
       await this.ensureKernel(panel);
     } catch (err) {
-      return fail(`kernel not available: ${messageOf(err)}`);
+      return fail('kernel_failed', `kernel not available: ${messageOf(err)}`, 'call kernel_restart');
     }
 
     let returned = false;
@@ -408,13 +491,94 @@ export class ToolDispatcher {
     const duration = Math.round(performance.now() - started);
     const summary =
       `ran ${model?.cells.length ?? 0} cells in ${duration}ms; ` +
-      (errors.length ? `${errors.length} error(s): ${errors.map(e => `${e.ename}: ${e.evalue}`).join('; ')}` : 'no errors');
+      (errors.length
+        ? `${errors.length} error(s): ${errors.map(e => `${e.ename}: ${e.evalue}`).join('; ')}`
+        : 'no errors');
+    const failed = !returned || Boolean(thrown) || errors.length > 0;
     return {
-      ok: returned && !thrown && errors.length === 0,
+      ok: !failed,
       content: [{ type: 'text', text: summary }],
       structured: { duration_ms: duration, errors, cells: model?.cells.length ?? 0 },
-      error: thrown ?? (errors.length ? errors.map(e => `${e.ename}: ${e.evalue}`).join('; ') : undefined),
+      error: failed
+        ? {
+            code: 'execution_error',
+            message: errors.map(e => `${e.ename}: ${e.evalue}`).join('; ') || thrown || 'run-all failed',
+            hint: 'the failing cell is in the notebook with its traceback',
+          }
+        : undefined,
     };
+  }
+
+  private async notebookFigures(): Promise<JobResult> {
+    const panel = this.requirePanel();
+    await this.ensureKernel(panel);
+    const kernel = panel.sessionContext.session?.kernel;
+    if (!kernel) {
+      return fail('kernel_failed', 'no kernel session');
+    }
+
+    const future = kernel.requestExecute({
+      code: FIGURE_CODE,
+      silent: false,
+      store_history: false,
+      user_expressions: {},
+      allow_stdin: false,
+      stop_on_error: false,
+    });
+
+    let out = '';
+    future.onIOPub = (msg: any) => {
+      const type = msg.header?.msg_type;
+      if (type === 'stream') {
+        out += String(msg.content?.text ?? '');
+      } else if (type === 'error') {
+        out += `${String(msg.content?.ename)}: ${String(msg.content?.evalue)}\n`;
+      }
+    };
+    await future.done;
+
+    const marker = out.split('\n').find(line => line.startsWith('MCP_FIGURES:'));
+    let figures: unknown[] = [];
+    if (marker) {
+      try {
+        const parsed = JSON.parse(marker.slice('MCP_FIGURES:'.length));
+        if (Array.isArray(parsed)) {
+          figures = parsed;
+        }
+      } catch {
+        figures = [];
+      }
+    }
+
+    if (figures.length === 0) {
+      return ok(
+        'No matplotlib figures are alive in the kernel. Run the plotting cell first; figures are cleared when the kernel restarts.',
+        { figures: [], count: 0 },
+      );
+    }
+
+    const lines = figures.map((f: any) => {
+      const head = `figure ${f.figure} / axes ${f.axes}: title=${JSON.stringify(f.title ?? '')} x=${JSON.stringify(f.xlabel ?? '')} y=${JSON.stringify(f.ylabel ?? '')}`;
+      const lineInfo = Array.isArray(f.lines)
+        ? f.lines
+            .map(
+              (l: any) =>
+                `${l.label} (${l.n} pts, x ${fmtRange(l.x)}, y ${fmtRange(l.y)})`,
+            )
+            .join('; ')
+        : '';
+      const collInfo = Array.isArray(f.collections)
+        ? f.collections
+            .map((c: any) => `${c.type} (${c.n} pts, x ${fmtRange(c.x)}, y ${fmtRange(c.y)})`)
+            .join('; ')
+        : '';
+      return [head, lineInfo, collInfo].filter(Boolean).join(' | ');
+    });
+
+    return ok(
+      `matplotlib figures (text summary; run the cell again to redraw):\n${lines.join('\n')}`,
+      { figures, count: figures.length },
+    );
   }
 
   private async kernelRestart(): Promise<JobResult> {
@@ -422,7 +586,7 @@ export class ToolDispatcher {
     try {
       await panel.sessionContext.restartKernel();
     } catch (err) {
-      return fail(`restart failed: ${messageOf(err)}`);
+      return fail('kernel_failed', `restart failed: ${messageOf(err)}`);
     }
     return ok('kernel restarted; Python state is gone, notebook cells remain', {
       kernel: panel.sessionContext.session?.kernel?.name ?? null,
@@ -436,28 +600,62 @@ export class ToolDispatcher {
     const dir = typeof args.path === 'string' ? args.path : '';
     const model = await this.contents.get(dir, { content: true });
     const items = (Array.isArray(model.content) ? model.content : []) as Contents.IModel[];
-    const entries = items.map(i => ({ name: i.name, path: i.path, type: i.type, size: i.size ?? null }));
-    return ok(entries.map(e => `${e.type === 'directory' ? 'dir ' : 'file'} ${e.path}`).join('\n') || '(empty)', {
-      path: dir,
-      entries,
-    });
+    const entries = items.map(i => ({
+      name: i.name,
+      path: i.path,
+      type: i.type,
+      size: i.size ?? null,
+    }));
+    return ok(
+      entries.map(e => `${e.type === 'directory' ? 'dir ' : 'file'} ${e.path}`).join('\n') || '(empty)',
+      { path: dir, entries },
+    );
   }
 
   private async fileRead(args: Record<string, unknown>): Promise<JobResult> {
     const path = String(args.path ?? '');
     if (!path) {
-      return fail('missing path');
+      return fail('invalid_argument', 'missing path', 'pass the file path, e.g. "README.md"');
     }
-    const model = await this.contents.get(path, { content: true, type: 'file', format: 'text' });
-    const text = typeof model.content === 'string' ? model.content : '';
     const max = typeof args.max_chars === 'number' ? args.max_chars : 20_000;
-    return ok(clip(text, max), { path, size: text.length });
+
+    // The contents API defaults to text; asking for base64 on known binary
+    // extensions avoids returning mojibake for figures and data files.
+    const binary = /\.(png|jpe?g|gif|webp|pdf|zip|gz|npy|npz|h5|hdf5|so|wasm|nbc|nbi)$/i.test(path);
+    let text = '';
+    const encoding: 'utf8' | 'base64' = binary ? 'base64' : 'utf8';
+    let size: number | null = null;
+    try {
+      const model = await this.contents.get(path, {
+        content: true,
+        type: 'file',
+        format: binary ? 'base64' : 'text',
+      });
+      size = model.size ?? null;
+      text = typeof model.content === 'string' ? model.content : '';
+    } catch {
+      throw new ToolError(
+        'not_found',
+        `could not read ${path}`,
+        'call file_list to see available files',
+      );
+    }
+
+    const body = clip(text, max);
+    return ok(body || '(empty file)', {
+      path,
+      chars: text.length,
+      size,
+      encoding,
+      truncated: body.length !== text.length,
+      content: body,
+    });
   }
 
   private async fileWrite(args: Record<string, unknown>): Promise<JobResult> {
     const path = String(args.path ?? '');
     if (!path) {
-      return fail('missing path');
+      return fail('invalid_argument', 'missing path', 'pass the file path, e.g. "notes/todo.md"');
     }
     await this.ensureParent(path);
     await this.contents.save(path, {
@@ -484,10 +682,10 @@ export class ToolDispatcher {
   private requirePanel(path?: unknown): NotebookPanel {
     const panel = this.panel(path);
     if (!panel) {
-      throw new Error(
-        typeof path === 'string' && path
-          ? `notebook not open: ${path}`
-          : 'no notebook open; call notebook_create first',
+      throw new ToolError(
+        'no_notebook',
+        typeof path === 'string' && path ? `notebook not open: ${path}` : 'no notebook is open',
+        'call notebook_open or notebook_create first',
       );
     }
     return panel;
@@ -495,9 +693,16 @@ export class ToolDispatcher {
 
   private findCell(panel: NotebookPanel, rawId: unknown): Cell {
     const id = String(rawId ?? '');
+    if (!id) {
+      throw new ToolError('invalid_argument', 'missing cell_id', 'call notebook_read to list cell ids');
+    }
     const cell = panel.content.widgets.find(c => c.model.id === id);
     if (!cell) {
-      throw new Error(`no such cell_id: ${id}; call notebook_read to list cells`);
+      throw new ToolError(
+        'unknown_cell',
+        `no such cell_id: ${id}`,
+        'call notebook_read to list the current cells; ids change if the notebook was recreated',
+      );
     }
     return cell;
   }
@@ -513,8 +718,7 @@ export class ToolDispatcher {
       const needsSelection = await panel.sessionContext.initialize().catch(() => true);
       if (needsSelection && !panel.sessionContext.session) {
         const preferred = this.pickKernelName(
-          kernelName ??
-            (panel.context.model?.metadata?.kernelspec?.name as string | undefined),
+          kernelName ?? (panel.context.model?.metadata?.kernelspec?.name as string | undefined),
         );
         const kernel = await panel.sessionContext
           .changeKernel({ name: preferred })
@@ -523,8 +727,10 @@ export class ToolDispatcher {
           // a preempted start can leave the second attempt returning null
           await new Promise(resolve => setTimeout(resolve, 1_000));
           if (!panel.sessionContext.session) {
-            throw new Error(
+            throw new ToolError(
+              'kernel_failed',
               `the kernel '${preferred}' did not start (available: ${this.kernelNames().join(', ') || 'none'})`,
+              'call site_info to see the kernels, then kernel_restart',
             );
           }
         }
@@ -532,7 +738,7 @@ export class ToolDispatcher {
     }
     await panel.sessionContext.ready;
     if (!panel.sessionContext.session) {
-      throw new Error('no kernel session after start');
+      throw new ToolError('kernel_failed', 'no kernel session after start', 'call kernel_restart');
     }
   }
 
@@ -590,6 +796,35 @@ export class ToolDispatcher {
     }
   }
 
+  private async saveImages(
+    panel: NotebookPanel,
+    cellId: string,
+    images: CollectedImage[],
+  ): Promise<Array<{ path: string; mimeType: string; bytes: number }>> {
+    if (!images.length) {
+      return [];
+    }
+    const stem = (panel.context.path.split('/').pop() ?? 'notebook').replace(/\.ipynb$/, '');
+    const dir = `_mcp/${stem}`;
+    await this.ensureParent(`${dir}/x`);
+    const saved: Array<{ path: string; mimeType: string; bytes: number }> = [];
+    for (const [i, image] of images.slice(0, 8).entries()) {
+      const ext = image.mimeType === 'image/jpeg' ? 'jpg' : 'png';
+      const path = `${dir}/${cellId}-${i}.${ext}`;
+      try {
+        await this.contents.save(path, {
+          type: 'file',
+          format: 'base64',
+          content: image.data,
+        });
+        saved.push({ path, mimeType: image.mimeType, bytes: image.bytes });
+      } catch (err) {
+        console.warn('mcp-hub: could not save figure', path, err);
+      }
+    }
+    return saved;
+  }
+
   private persist(panel: NotebookPanel): void {
     void panel.context.save().catch(err => {
       console.warn('mcp-hub: save failed', err);
@@ -601,8 +836,12 @@ function ok(text: string, structured?: Record<string, unknown>): JobResult {
   return { ok: true, content: [{ type: 'text', text }], structured };
 }
 
-function fail(text: string): JobResult {
-  return { ok: false, content: [{ type: 'text', text }], error: text };
+function fail(code: string, text: string, hint?: string): JobResult {
+  return {
+    ok: false,
+    content: [{ type: 'text', text: hint ? `${text}\n${hint}` : text }],
+    error: { code, message: text, hint },
+  };
 }
 
 function clip(text: string, max: number): string {
@@ -612,6 +851,61 @@ function clip(text: string, max: number): string {
   return `${text.slice(0, max)}\n…[truncated ${text.length - max} chars]`;
 }
 
+function fmtRange(range: unknown): string {
+  if (!Array.isArray(range) || range.length !== 2) {
+    return '?';
+  }
+  const [a, b] = range as [number, number];
+  const f = (n: number) => (Math.abs(n) >= 1000 || Math.abs(n) < 0.01 ? n.toExponential(2) : n.toFixed(3));
+  return `${f(a)}..${f(b)}`;
+}
+
 function messageOf(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
+
+const FIGURE_CODE = `
+import json
+try:
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    figs = []
+    for num in list(plt.get_fignums())[:12]:
+        fig = plt.figure(num)
+        for i, ax in enumerate(list(fig.axes)[:8]):
+            e = {"figure": num, "axes": i, "title": ax.get_title(),
+                 "xlabel": ax.get_xlabel(), "ylabel": ax.get_ylabel()}
+            lines = []
+            for ln in list(ax.lines)[:12]:
+                x = np.asarray(ln.get_xdata(), dtype=float).ravel()
+                y = np.asarray(ln.get_ydata(), dtype=float).ravel()
+                lines.append({
+                    "label": str(ln.get_label()),
+                    "n": int(y.size),
+                    "x": [float(np.nanmin(x)), float(np.nanmax(x))] if x.size else None,
+                    "y": [float(np.nanmin(y)), float(np.nanmax(y))] if y.size else None,
+                })
+            if lines:
+                e["lines"] = lines
+            cols = []
+            for c in list(ax.collections)[:8]:
+                try:
+                    a = np.asarray(c.get_offsets(), dtype=float)
+                    if a.ndim == 2 and a.shape[0]:
+                        cols.append({
+                            "type": type(c).__name__,
+                            "n": int(a.shape[0]),
+                            "x": [float(np.nanmin(a[:, 0])), float(np.nanmax(a[:, 0]))],
+                            "y": [float(np.nanmin(a[:, 1])), float(np.nanmax(a[:, 1]))],
+                        })
+                except Exception:
+                    pass
+            if cols:
+                e["collections"] = cols
+            figs.append(e)
+    print("MCP_FIGURES:" + json.dumps(figs))
+except Exception as exc:
+    print("MCP_FIGURES:[]")
+    print("MCP_FIGURES_ERR:" + repr(exc))
+`;
