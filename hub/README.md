@@ -111,3 +111,26 @@ Errors never carry `job_id` or `status`, so a client only has to look at
 Mutating tools accept an optional `idempotency_key`; a retry with the same key
 within 10 minutes returns the original job instead of executing again (the DO
 stores `idem:<kind>:<key> -> job id`).
+
+## Async and job handles
+
+`cell_run` / `notebook_run_all` accept `wait_ms` (default `INLINE_WAIT_MS`, 20 s).
+`wait_ms: 0` returns `{ok:true, status:"running", job_id}` in a few milliseconds;
+`job_result` long-polls (`wait_ms`, default 15 s, max 25 s) so the model does not
+have to spin. The runner keeps executing and the result is stored even if the
+client goes away, so a handle can be collected minutes later.
+
+The wait is a policy choice: holding the request open costs Durable Object
+duration (128 MB is the billed allocation), so `wait_ms: 0` is ~100× cheaper per
+call than the default inline wait.
+
+## Pairing guards
+
+- `/pair/challenge` issues a SHA-256 proof-of-work nonce (`POW_BITS`, default 15;
+  `0` disables it). `/pair` spends the nonce; replays, expired nonces and
+  insufficient work are rejected.
+- Rate limit per /24 (IPv4) or /64 (IPv6): `PAIR_RATE_PER_HOUR`, default 6.
+- `PAIR_TTL_SECONDS` (default 86400): an alarm deletes pairs that no runner ever
+  claimed; the first successful runner auth cancels the alarm.
+- All of it lives in one `PairGuard` Durable Object (`GUARD`), so counters and
+  nonce spends are atomic.

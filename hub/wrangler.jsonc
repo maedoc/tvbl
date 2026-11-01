@@ -6,10 +6,20 @@
   "compatibility_flags": ["nodejs_compat"],
   "observability": { "enabled": true },
   "vars": {
-    "RUNNER_URL": "https://maedoc.github.io/tvbl/"
+    "RUNNER_URL": "https://maedoc.github.io/tvbl/",
+    "POW_BITS": "15",
+    "PAIR_TTL_SECONDS": "86400",
+    "PAIR_RATE_PER_HOUR": "6",
+    "INLINE_WAIT_MS": "20000"
   },
   "durable_objects": {
-    "bindings": [{ "name": "HUB", "class_name": "RunnerHub" }]
+    "bindings": [
+      { "name": "HUB", "class_name": "RunnerHub" },
+      { "name": "GUARD", "class_name": "PairGuard" }
+    ]
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["RunnerHub"] }]
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["RunnerHub"] },
+    { "tag": "v2", "new_sqlite_classes": ["PairGuard"] }
+  ]
 }

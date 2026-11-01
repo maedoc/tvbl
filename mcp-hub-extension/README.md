@@ -13,9 +13,10 @@ there.
 
 ## What it does
 
-- **Pair**: `POST /pair` mints a pair id + token, saves them in the JupyterLab
-  settings registry, opens `wss://hub/run?pair=…` and authenticates with the
-  token as the first frame.
+- **Pair**: solves the hub's proof-of-work challenge (a few hundred ms, skipped
+  against old hubs), `POST /pair` mints a pair id + token, saves them in the
+  JupyterLab settings registry, opens `wss://hub/run?pair=…` and authenticates
+  with the token as the first frame.
 - **Serve**: every `job` frame is executed against real JupyterLab APIs —
   `NotebookActions.runCells` for execution (so widget comms and output areas
   behave exactly as if the user pressed Shift+Enter), the shared notebook model

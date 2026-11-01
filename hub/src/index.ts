@@ -4,8 +4,9 @@ import { CfWorkerJsonSchemaValidator } from "@modelcontextprotocol/sdk/validatio
 import type { CallToolResult, ContentBlock } from "@modelcontextprotocol/sdk/types.js";
 import { z, type ZodRawShape } from "zod";
 import { RunnerHub, normalizeJobError, sha256hex, type Env, type JobError } from "./hub";
+import { PairGuard } from "./guard";
 
-export { RunnerHub };
+export { RunnerHub, PairGuard };
 
 // ── limits ─────────────────────────────────────────────────────────
 
@@ -38,8 +39,15 @@ export default {
       return json({ ok: true, now: Date.now(), service: "tvbl-mcp-hub" });
     }
 
-    if (url.pathname === "/pair" && request.method === "OPTIONS") {
+    if (
+      (url.pathname === "/pair" || url.pathname === "/pair/challenge") &&
+      request.method === "OPTIONS"
+    ) {
       return withCors(new Response(null, { status: 204 }));
+    }
+
+    if (url.pathname === "/pair/challenge" && request.method === "POST") {
+      return withCors(await createChallenge(request, env));
     }
 
     if (url.pathname === "/pair" && request.method === "POST") {
@@ -75,14 +83,16 @@ export default {
 // ── MCP ────────────────────────────────────────────────────────────
 
 async function handleMcp(request: Request, env: Env, pairId: string): Promise<Response> {
+  const inline = Number(env.INLINE_WAIT_MS ?? "");
+  const runWait = Number.isFinite(inline) && inline >= 0 ? Math.floor(inline) : RUN_WAIT_MS;
   const server = new McpServer(
-    { name: "tvbl-mcp-hub", version: "0.2.0", title: "TVBL JupyterLite notebook" },
+    { name: "tvbl-mcp-hub", version: "0.3.0", title: "TVBL JupyterLite notebook" },
     {
       instructions: INSTRUCTIONS,
       jsonSchemaValidator: new CfWorkerJsonSchemaValidator(),
     },
   );
-  registerTools(server, env, pairId);
+  registerTools(server, env, pairId, runWait);
 
   const transport = new WebStandardStreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
@@ -297,7 +307,16 @@ const SPECS: ToolSpec[] = [
     title: "Job result",
     description:
       "Use this to fetch the result of a job that returned status 'running'. Returns status 'running' until the runner finishes.",
-    shape: { job_id: z.string() },
+    shape: {
+      job_id: z.string(),
+      wait_ms: z
+        .number()
+        .int()
+        .min(0)
+        .max(25_000)
+        .optional()
+        .describe("Long-poll for up to this long; default 15000."),
+    },
     annotations: { readOnlyHint: true, idempotentHint: true },
     local: "job",
   },
@@ -351,7 +370,7 @@ const SPECS: ToolSpec[] = [
   },
 ];
 
-function registerTools(server: McpServer, env: Env, pairId: string): void {
+function registerTools(server: McpServer, env: Env, pairId: string, runWait: number): void {
   for (const spec of SPECS) {
     server.registerTool(
       spec.name,
@@ -363,10 +382,21 @@ function registerTools(server: McpServer, env: Env, pairId: string): void {
       },
       async (args: Record<string, unknown>): Promise<CallToolResult> => {
         if (spec.local === "status") return siteInfo(env, pairId);
-        if (spec.local === "job") return jobResult(env, pairId, String(args.job_id ?? ""));
+        if (spec.local === "job") {
+          return jobResult(
+            env,
+            pairId,
+            String(args.job_id ?? ""),
+            Math.min(25_000, clampWait(args.wait_ms, 15_000)),
+          );
+        }
         if (spec.local === "cancel") return jobCancel(env, pairId, String(args.job_id ?? ""));
         const { idempotency_key, wait_ms, ...forward } = args;
-        const wait = clampWait(wait_ms, spec.waitMs ?? DEFAULT_WAIT_MS);
+        const fallback =
+          spec.kind === "cell_run" || spec.kind === "notebook_run_all"
+            ? runWait
+            : (spec.waitMs ?? DEFAULT_WAIT_MS);
+        const wait = clampWait(wait_ms, fallback);
         const key = typeof idempotency_key === "string" ? idempotency_key : undefined;
         return present(
           await relay(env, pairId, spec.kind ?? spec.name, forward, wait, key),
@@ -436,9 +466,13 @@ async function siteInfo(env: Env, pairId: string): Promise<CallToolResult> {
   };
 }
 
-async function jobResult(env: Env, pairId: string, id: string): Promise<CallToolResult> {
+async function jobResult(env: Env, pairId: string, id: string, waitMs: number): Promise<CallToolResult> {
   if (!id) return errorResult("invalid_argument", "missing job_id");
-  const r = (await doJson(env, pairId, `/job?id=${encodeURIComponent(id)}`)) as RelayResponse;
+  const r = (await doJson(
+    env,
+    pairId,
+    `/job?id=${encodeURIComponent(id)}&wait=${Math.max(0, waitMs)}`,
+  )) as RelayResponse;
   return present(r);
 }
 
@@ -604,8 +638,47 @@ function truncate(text: string, max: number): string {
 
 // ── pairing ────────────────────────────────────────────────────────
 
+async function createChallenge(request: Request, env: Env): Promise<Response> {
+  const { bits, rate } = powConfig(env);
+  const limited = await rateLimit(env, request, rate);
+  if (limited) return limited;
+  if (bits === 0) return json({ nonce: null, bits: 0 });
+  const res = await env.GUARD.getByName("global").fetch("https://guard/challenge", {
+    method: "POST",
+    body: JSON.stringify({ bits }),
+  });
+  if (!res.ok) return json({ error: "challenge_failed" }, 500);
+  return new Response(res.body, {
+    status: 200,
+    headers: { "content-type": "application/json; charset=utf-8" },
+  });
+}
+
 async function createPair(request: Request, env: Env): Promise<Response> {
-  const body = (await request.json().catch(() => ({}))) as { label?: string };
+  const body = (await request.json().catch(() => ({}))) as {
+    label?: string;
+    nonce?: string;
+    solution?: string;
+  };
+  const { bits, rate } = powConfig(env);
+
+  if (bits > 0) {
+    if (!body.nonce || typeof body.solution !== "string") {
+      return json({ error: "proof_of_work_required" }, 401);
+    }
+    const spend = await env.GUARD.getByName("global").fetch("https://guard/spend", {
+      method: "POST",
+      body: JSON.stringify({ nonce: body.nonce, solution: body.solution, bits }),
+    });
+    const spent = (await spend.json().catch(() => ({}))) as { ok?: boolean; reason?: string };
+    if (!spent.ok) {
+      return json({ error: "proof_of_work_failed", reason: spent.reason }, 401);
+    }
+  } else {
+    const limited = await rateLimit(env, request, rate);
+    if (limited) return limited;
+  }
+
   const pairId = randomHex(8);
   const token = randomHex(32);
   const stub = env.HUB.getByName(pairId);
@@ -627,6 +700,36 @@ async function createPair(request: Request, env: Env): Promise<Response> {
     },
     201,
   );
+}
+
+function powConfig(env: Env): { bits: number; rate: number } {
+  const bits = Number(env.POW_BITS ?? "15");
+  const rate = Number(env.PAIR_RATE_PER_HOUR ?? "6");
+  return {
+    bits: Number.isFinite(bits) && bits > 0 ? Math.min(24, Math.floor(bits)) : 0,
+    rate: Number.isFinite(rate) && rate > 0 ? Math.floor(rate) : 0,
+  };
+}
+
+async function rateLimit(env: Env, request: Request, limit: number): Promise<Response | null> {
+  if (limit <= 0) return null;
+  const ip = request.headers.get("CF-Connecting-IP") ?? "unknown";
+  const bucket = await sha256hex(familyBucket(ip));
+  const res = await env.GUARD.getByName("global").fetch("https://guard/rate", {
+    method: "POST",
+    body: JSON.stringify({ bucket, limit, windowMs: 3_600_000 }),
+  });
+  if (res.ok) return null;
+  const body = (await res.json().catch(() => ({}))) as { retryAfter?: number };
+  return json({ error: "rate_limited", retry_after: body.retryAfter ?? 3600 }, 429);
+}
+
+/** Coarse bucket: /24 for IPv4, /64 for IPv6 (a customer normally owns a /64). */
+function familyBucket(ip: string): string {
+  if (ip.includes(".")) {
+    return `${ip.split(".").slice(0, 3).join(".")}.0/24`;
+  }
+  return `${ip.split(":").filter(Boolean).slice(0, 4).join(":")}::/64`;
 }
 
 function bearer(request: Request): string {

@@ -117,10 +117,35 @@ const plugin: JupyterFrontEndPlugin<void> = {
       try {
         const base = cfg.hubUrl.replace(/\/+$/, '');
         panel.log('info', `pairing with ${base} …`);
+
+        // Optional proof-of-work: the hub sets POW_BITS=0 to disable it, and an
+        // older hub answers 404, in which case we pair without it.
+        let pow: { nonce: string; solution: string } | undefined;
+        const challengeRes = await fetch(`${base}/pair/challenge`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: '{}',
+        });
+        if (challengeRes.ok) {
+          const challenge = (await challengeRes.json()) as { nonce: string | null; bits: number };
+          if (challenge.bits > 0 && challenge.nonce) {
+            panel.log('info', `solving proof-of-work (${challenge.bits} bits)…`);
+            const startedAt = performance.now();
+            const solution = await solveProofOfWork(challenge.nonce, challenge.bits);
+            pow = { nonce: challenge.nonce, solution };
+            panel.log('info', `proof-of-work solved in ${Math.round(performance.now() - startedAt)}ms`);
+          }
+        } else if (challengeRes.status === 429) {
+          const body = (await challengeRes.json().catch(() => ({}))) as { retry_after?: number };
+          throw new Error(`too many pairings; retry in ${body.retry_after ?? 'a while'}s`);
+        } else if (challengeRes.status !== 404) {
+          throw new Error(`pair challenge failed: HTTP ${challengeRes.status}`);
+        }
+
         const res = await fetch(`${base}/pair`, {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ label: `JupyterLite ${location.host}` }),
+          body: JSON.stringify({ label: `JupyterLite ${location.host}`, ...(pow ?? {}) }),
         });
         if (!res.ok) {
           throw new Error(`pair failed: HTTP ${res.status} ${await res.text()}`);
@@ -204,6 +229,31 @@ function readSettings(settings: ISettingRegistry.ISettings): HubSettings {
     logLimit: Math.max(20, Math.min(2000, num('logLimit', 200))),
     maxImageBytes: Math.max(10_000, Math.min(2_000_000, num('maxImageBytes', 200_000))),
   };
+}
+
+async function solveProofOfWork(nonce: string, bits: number): Promise<string> {
+  const encoder = new TextEncoder();
+  for (let i = 0; ; i++) {
+    const solution = i.toString(36);
+    const digest = new Uint8Array(
+      await crypto.subtle.digest('SHA-256', encoder.encode(nonce + solution)),
+    );
+    let have = 0;
+    for (const byte of digest) {
+      if (byte === 0) {
+        have += 8;
+        continue;
+      }
+      have += Math.clz32(byte) - 24;
+      break;
+    }
+    if (have >= bits) {
+      return solution;
+    }
+    if ((i & 0x3ff) === 0 && i > 0) {
+      await new Promise(resolve => setTimeout(resolve, 0));
+    }
+  }
 }
 
 function keyOf(cfg: HubSettings): string {

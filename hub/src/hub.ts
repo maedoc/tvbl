@@ -1,4 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
+import type { PairGuard } from "./guard";
 
 /**
  * One RunnerHub per pairing. Holds:
@@ -10,7 +11,12 @@ import { DurableObject } from "cloudflare:workers";
 
 export interface Env {
   HUB: DurableObjectNamespace<RunnerHub>;
+  GUARD: DurableObjectNamespace<PairGuard>;
   RUNNER_URL?: string;
+  PAIR_TTL_SECONDS?: string;
+  PAIR_RATE_PER_HOUR?: string;
+  POW_BITS?: string;
+  INLINE_WAIT_MS?: string;
 }
 
 export const JOB_TTL_MS = 60 * 60 * 1000;
@@ -42,6 +48,8 @@ interface PairRecord {
   tokenHash: string;
   createdAt: number;
   label?: string;
+  /** Set when a runner first authenticates; unclaimed pairs are GC'd by alarm. */
+  claimedAt?: number;
 }
 
 interface IdemRecord {
@@ -123,7 +131,10 @@ export class RunnerHub extends DurableObject<Env> {
       case "POST /call":
         return this.call(request);
       case "GET /job":
-        return this.job(url.searchParams.get("id") ?? "");
+        return this.job(
+          url.searchParams.get("id") ?? "",
+          Number(url.searchParams.get("wait") ?? 0),
+        );
       case "POST /cancel":
         return this.cancel(request);
       default:
@@ -137,11 +148,16 @@ export class RunnerHub extends DurableObject<Env> {
     const body = (await request.json()) as { tokenHash: string; label?: string };
     const existing = await this.ctx.storage.get<PairRecord>("pair");
     if (existing) return new Response("pair already initialised", { status: 409 });
+    const created = Date.now();
     await this.ctx.storage.put<PairRecord>("pair", {
       tokenHash: body.tokenHash,
-      createdAt: Date.now(),
+      createdAt: created,
       label: body.label,
     });
+    const ttl = Number(this.env.PAIR_TTL_SECONDS ?? "0");
+    if (Number.isFinite(ttl) && ttl > 0) {
+      await this.ctx.storage.setAlarm(created + ttl * 1000);
+    }
     return json({ ok: true });
   }
 
@@ -284,13 +300,18 @@ export class RunnerHub extends DurableObject<Env> {
     });
   }
 
-  private async job(id: string): Promise<Response> {
+  private async job(id: string, waitMs = 0): Promise<Response> {
     if (!id) {
       return json({ status: "error", error: { code: "invalid_argument", message: "missing job_id" } }, 400);
     }
-    const job = await this.ctx.storage.get<JobRecord>(`job:${id}`);
+    let job = await this.ctx.storage.get<JobRecord>(`job:${id}`);
     if (!job) {
       return json({ status: "error", error: { code: "job_unknown", message: `unknown job_id: ${id}` } }, 404);
+    }
+    if ((job.status === "running" || job.status === "queued") && waitMs > 0) {
+      const done = await this.waitFor(id, Math.min(waitMs, 25_000));
+      if (done) return json(toRelay(done));
+      job = (await this.ctx.storage.get<JobRecord>(`job:${id}`)) ?? job;
     }
     if (
       (job.status === "running" || job.status === "queued") &&
@@ -351,6 +372,11 @@ export class RunnerHub extends DurableObject<Env> {
         clearTimeout(timer);
         this.authTimers.delete(ws);
       }
+      if (pair && !pair.claimedAt) {
+        pair.claimedAt = Date.now();
+        await this.ctx.storage.put("pair", pair);
+        await this.ctx.storage.deleteAlarm();
+      }
       const att: Attachment = { authed: true, label: frame.label, lastSeen: Date.now() };
       ws.serializeAttachment(att);
       ws.send(JSON.stringify({ type: "hello", pair: true }));
@@ -403,6 +429,14 @@ export class RunnerHub extends DurableObject<Env> {
       clearTimeout(timer);
       this.authTimers.delete(ws);
     }
+  }
+
+  /** Delete pair records that were minted but never claimed by a runner. */
+  async alarm(): Promise<void> {
+    const pair = await this.ctx.storage.get<PairRecord>("pair");
+    if (!pair) return;
+    if (pair.claimedAt) return;
+    await this.ctx.storage.deleteAll();
   }
 
   private async prune(): Promise<void> {
