@@ -154,6 +154,7 @@ export class ToolDispatcher {
   }
 
   private async notebookCreate(args: Record<string, unknown>): Promise<JobResult> {
+    await this.app.serviceManager.kernelspecs.ready;
     const requested = typeof args.path === 'string' ? args.path : null;
     const spec = this.kernelSpec(typeof args.kernel === 'string' ? args.kernel : undefined);
 
@@ -502,21 +503,30 @@ export class ToolDispatcher {
   }
 
   private async ensureKernel(panel: NotebookPanel, kernelName?: string): Promise<void> {
+    // The xeus/pyodide kernelspecs arrive with the service worker; starting a
+    // session before they are registered fails with a generic error.
+    await this.app.serviceManager.kernelspecs.ready;
+
     if (!panel.sessionContext.session) {
       // `initialize()` resolves with `true` when the user must pick a kernel,
       // and rejects (rather than returning false) on a real failure.
       const needsSelection = await panel.sessionContext.initialize().catch(() => true);
       if (needsSelection && !panel.sessionContext.session) {
-        await this.app.serviceManager.kernelspecs.ready;
-        const preferred =
+        const preferred = this.pickKernelName(
           kernelName ??
-          (panel.context.model?.metadata?.kernelspec?.name as string | undefined) ??
-          this.kernelSpec().name;
+            (panel.context.model?.metadata?.kernelspec?.name as string | undefined),
+        );
         const kernel = await panel.sessionContext
           .changeKernel({ name: preferred })
           .catch(() => null);
         if (!kernel && !panel.sessionContext.session) {
-          throw new Error(`the kernel '${preferred}' did not start`);
+          // a preempted start can leave the second attempt returning null
+          await new Promise(resolve => setTimeout(resolve, 1_000));
+          if (!panel.sessionContext.session) {
+            throw new Error(
+              `the kernel '${preferred}' did not start (available: ${this.kernelNames().join(', ') || 'none'})`,
+            );
+          }
         }
       }
     }
@@ -526,9 +536,26 @@ export class ToolDispatcher {
     }
   }
 
+  private kernelNames(): string[] {
+    const specs = this.app.serviceManager.kernelspecs.specs;
+    return specs ? Object.keys(specs.kernelspecs) : [];
+  }
+
+  private pickKernelName(requested?: string): string {
+    const specs = this.app.serviceManager.kernelspecs.specs;
+    const available = specs ? Object.keys(specs.kernelspecs) : [];
+    if (requested && (available.length === 0 || available.includes(requested))) {
+      return requested;
+    }
+    if (specs?.default && (available.length === 0 || available.includes(specs.default))) {
+      return specs.default;
+    }
+    return available[0] ?? requested ?? 'python';
+  }
+
   private kernelSpec(name?: string): { name: string; display_name: string; language: string } {
     const specs = this.app.serviceManager.kernelspecs.specs;
-    const name2 = name || specs?.default || 'python3';
+    const name2 = this.pickKernelName(name);
     const spec = specs?.kernelspecs?.[name2]?.spec as
       | { display_name?: string; language?: string }
       | undefined;
