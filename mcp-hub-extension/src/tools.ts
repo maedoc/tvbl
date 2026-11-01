@@ -503,17 +503,21 @@ export class ToolDispatcher {
 
   private async ensureKernel(panel: NotebookPanel, kernelName?: string): Promise<void> {
     if (!panel.sessionContext.session) {
-      const preferred =
-        kernelName ??
-        (panel.context.model?.metadata?.kernelspec?.name as string | undefined) ??
-        this.kernelSpec().name;
-      // `initialize()` can return false while the panel is already starting a
-      // session; `changeKernel` is deterministic and waits for the connection.
-      const kernel = await panel.sessionContext
-        .changeKernel({ name: preferred })
-        .catch(() => null);
-      if (!kernel && !panel.sessionContext.session) {
-        throw new Error(`the kernel '${preferred}' did not start`);
+      // `initialize()` resolves with `true` when the user must pick a kernel,
+      // and rejects (rather than returning false) on a real failure.
+      const needsSelection = await panel.sessionContext.initialize().catch(() => true);
+      if (needsSelection && !panel.sessionContext.session) {
+        await this.app.serviceManager.kernelspecs.ready;
+        const preferred =
+          kernelName ??
+          (panel.context.model?.metadata?.kernelspec?.name as string | undefined) ??
+          this.kernelSpec().name;
+        const kernel = await panel.sessionContext
+          .changeKernel({ name: preferred })
+          .catch(() => null);
+        if (!kernel && !panel.sessionContext.session) {
+          throw new Error(`the kernel '${preferred}' did not start`);
+        }
       }
     }
     await panel.sessionContext.ready;
