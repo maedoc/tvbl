@@ -125,3 +125,9 @@ wasm-tests/notebook.txt
 # CI-built wasm packages / generated kernel env
 local-channel/
 environment.ci.yml
+
+# cloudflare hub
+hub/.wrangler/
+hub/.dev.vars
+.cf-tvbl.env
+*.env

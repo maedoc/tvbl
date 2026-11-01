@@ -1,0 +1,15 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "tvbl-mcp-hub",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-27",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+  "vars": {
+    "RUNNER_URL": "https://maedoc.github.io/tvbl/"
+  },
+  "durable_objects": {
+    "bindings": [{ "name": "HUB", "class_name": "RunnerHub" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["RunnerHub"] }]
+}
