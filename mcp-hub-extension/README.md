@@ -53,7 +53,7 @@ Settings → MCP Hub:
 
 | setting | default | |
 | --- | --- | --- |
-| `hubUrl` | `https://tvbl-mcp-hub.marmaduke-woodman.workers.dev` | Worker base URL |
+| `hubUrl` | `https://tvbl-mcp-hub.marmaduke-woodman.workers.dev` | Worker base URL (a `jupyter-config-data/mcpHubUrl` value is used when the setting has no user override, e.g. for local `wrangler dev`) |
 | `pairId` / `pairToken` | — | written by the Pair button |
 | `autoConnect` | `true` | reconnect when the page loads |
 | `maxImageBytes` | `200000` | PNGs above this are downscaled via OffscreenCanvas |

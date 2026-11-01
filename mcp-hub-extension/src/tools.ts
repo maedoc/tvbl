@@ -9,10 +9,12 @@ import type { Contents } from '@jupyterlab/services';
 import type { ITranslator } from '@jupyterlab/translation';
 
 import { collectOutputs, sanitizeOutputs, type CollectedImage } from './output';
-import type { JobFrame, JobResult } from './types';
+import type { Content, JobFrame, JobResult } from './types';
 
 const SOURCE_CLIP = 6_000;
-const OUTPUT_CLIP = 12_000;
+const OUTPUT_CLIP = 8_000;
+const INLINE_TEXT = 8_000;
+const MAX_ATTACHMENT = 1_000_000;
 
 class ToolError extends Error {
   constructor(
@@ -87,6 +89,14 @@ export class ToolDispatcher {
         return this.fileRead(args);
       case 'file_write':
         return this.fileWrite(args);
+      case 'file_stat':
+        return this.fileStat(args);
+      case 'file_delete':
+        return this.fileDelete(args);
+      case 'file_move':
+        return this.fileMove(args);
+      case 'file_mkdir':
+        return this.fileMkdir(args);
       default:
         return fail('unknown_tool', `unknown job kind: ${frame.kind}`, 'this hub is newer than the runner; reload the page');
     }
@@ -144,13 +154,19 @@ export class ToolDispatcher {
     }
     const includeOutputs = args.include_outputs !== false;
     const maxCell = typeof args.max_cell_chars === 'number' ? args.max_cell_chars : SOURCE_CLIP;
+    const maxOutputText = typeof args.max_chars === 'number' ? args.max_chars : OUTPUT_CLIP;
+    const maxImages = typeof args.max_images === 'number' ? args.max_images : 4;
     const model = panel.content.model;
     if (!model) {
       return fail('not_found', 'the notebook has no model');
     }
 
     const cells = [];
+    const content: Content[] = [];
+    let textBudget = maxOutputText;
+    let imageCount = 0;
     let anyTruncated = false;
+
     for (let i = 0; i < model.cells.length; i++) {
       const cell = model.cells.get(i);
       const code = cell.type === 'code' ? (cell as ICodeCellModel) : null;
@@ -159,6 +175,33 @@ export class ToolDispatcher {
       if (clipped.length !== source.length) {
         anyTruncated = true;
       }
+
+      let outputs: unknown[] | undefined;
+      if (includeOutputs && code) {
+        const raw = code.outputs.toJSON();
+        if (raw.length) {
+          outputs = sanitizeOutputs(raw);
+          const widget = panel.content.widgets[i];
+          if (!widget) {
+            continue;
+          }
+          const collected = await collectOutputs(widget, this.maxImageBytes, maxOutputText);
+          for (const block of collected.content) {
+            if (block.type === 'text') {
+              if (textBudget <= 0 || block.text === '(no output)') {
+                continue;
+              }
+              const text = clip(block.text, textBudget);
+              textBudget -= text.length;
+              content.push({ type: 'text', text });
+            } else if (imageCount < maxImages) {
+              content.push(block);
+              imageCount++;
+            }
+          }
+        }
+      }
+
       cells.push({
         cell_id: cell.id,
         index: i,
@@ -168,16 +211,15 @@ export class ToolDispatcher {
         source_truncated: clipped.length !== source.length,
         execution_count: code?.executionCount ?? null,
         execution_state: code?.executionState ?? null,
-        ...(includeOutputs && code
-          ? { outputs: sanitizeOutputs(code.outputs.toJSON()) }
-          : {}),
+        ...(outputs ? { outputs } : {}),
       });
     }
 
     const summary = [
       `${panel.context.path}: ${cells.length} cells` +
         (includeOutputs ? '' : ' (outputs omitted)') +
-        (anyTruncated ? ` (sources capped at ${maxCell} chars)` : ''),
+        (anyTruncated ? ` (sources capped at ${maxCell} chars)` : '') +
+        (imageCount ? ` (${imageCount} stored image(s) attached)` : ''),
     ]
       .concat(
         cells.map(c => {
@@ -188,12 +230,17 @@ export class ToolDispatcher {
       )
       .join('\n');
 
-    return ok(summary, {
-      path: panel.context.path,
-      kernel: panel.sessionContext.session?.kernel?.name ?? null,
-      cells,
-      truncated: anyTruncated,
-    });
+    return {
+      ok: true,
+      content: [{ type: 'text', text: summary }, ...content],
+      structured: {
+        path: panel.context.path,
+        kernel: panel.sessionContext.session?.kernel?.name ?? null,
+        cells,
+        truncated: anyTruncated,
+        images: imageCount,
+      },
+    };
   }
 
   private async notebookCreate(args: Record<string, unknown>): Promise<JobResult> {
@@ -407,8 +454,12 @@ export class ToolDispatcher {
       thrown = messageOf(err);
     }
 
-    const collected = await collectOutputs(cell, this.maxImageBytes, OUTPUT_CLIP);
+    const collected = await collectOutputs(cell, this.maxImageBytes, INLINE_TEXT);
     const images = await this.saveImages(panel, cell.model.id, collected.images);
+    const stdout =
+      collected.text.length > INLINE_TEXT
+        ? await this.saveAttachment(panel, cell.model.id, 'stdout.txt', collected.text)
+        : null;
     const duration = Math.round(performance.now() - started);
     const code = cell.model.type === 'code' ? (cell.model as ICodeCellModel) : null;
     const content = [...collected.content];
@@ -416,6 +467,14 @@ export class ToolDispatcher {
       content.push({
         type: 'text',
         text: `[figures saved: ${images.map(i => i.path).join(', ')}]`,
+      });
+    }
+    if (stdout) {
+      content.push({
+        type: 'text',
+        text:
+          `[stdout: ${collected.text.length} chars; first ${INLINE_TEXT} inline; ` +
+          `full output at ${stdout} — use file_read with offset to page through it]`,
       });
     }
     if (thrown && !collected.hasError) {
@@ -434,6 +493,11 @@ export class ToolDispatcher {
         execution_count: code?.executionCount ?? null,
         outputs: collected.raw,
         images,
+        stdout: {
+          chars: collected.text.length,
+          path: stdout,
+          inline_chars: Math.min(collected.text.length, INLINE_TEXT),
+        },
       },
       error: failed
         ? {
@@ -618,18 +682,18 @@ export class ToolDispatcher {
       return fail('invalid_argument', 'missing path', 'pass the file path, e.g. "README.md"');
     }
     const max = typeof args.max_chars === 'number' ? args.max_chars : 20_000;
+    const offset = Math.max(0, Math.floor(Number(args.offset ?? 0)) || 0);
+    const requested = String(args.encoding ?? 'auto');
+    const binaryByExt = /\.(png|jpe?g|gif|webp|pdf|zip|gz|npy|npz|h5|hdf5|so|wasm|nbc|nbi|pkl|parquet|mat)$/i.test(path);
+    const asBase64 = requested === 'base64' || (requested === 'auto' && binaryByExt);
 
-    // The contents API defaults to text; asking for base64 on known binary
-    // extensions avoids returning mojibake for figures and data files.
-    const binary = /\.(png|jpe?g|gif|webp|pdf|zip|gz|npy|npz|h5|hdf5|so|wasm|nbc|nbi)$/i.test(path);
     let text = '';
-    const encoding: 'utf8' | 'base64' = binary ? 'base64' : 'utf8';
     let size: number | null = null;
     try {
       const model = await this.contents.get(path, {
         content: true,
         type: 'file',
-        format: binary ? 'base64' : 'text',
+        format: asBase64 ? 'base64' : 'text',
       });
       size = model.size ?? null;
       text = typeof model.content === 'string' ? model.content : '';
@@ -641,13 +705,16 @@ export class ToolDispatcher {
       );
     }
 
-    const body = clip(text, max);
-    return ok(body || '(empty file)', {
+    const body = text.slice(offset, offset + max);
+    const next = offset + body.length < text.length ? offset + body.length : null;
+    return ok(body || (text ? `(offset ${offset} is past the end; ${text.length} chars total)` : '(empty file)'), {
       path,
+      offset,
       chars: text.length,
       size,
-      encoding,
-      truncated: body.length !== text.length,
+      encoding: asBase64 ? 'base64' : 'utf8',
+      truncated: next !== null,
+      next_offset: next,
       content: body,
     });
   }
@@ -657,13 +724,207 @@ export class ToolDispatcher {
     if (!path) {
       return fail('invalid_argument', 'missing path', 'pass the file path, e.g. "notes/todo.md"');
     }
+    const mode = String(args.mode ?? 'overwrite');
+    const payload = String(args.content ?? '');
+
+    if (mode === 'overwrite') {
+      await this.ensureParent(path);
+      await this.contents.save(path, { type: 'file', format: 'text', content: payload });
+      return ok(`wrote ${path}`, {
+        path,
+        mode,
+        chars: payload.length,
+        lines: payload.split('\n').length,
+      });
+    }
+
+    if (!['append', 'replace', 'lines'].includes(mode)) {
+      return fail('invalid_argument', `unknown mode: ${mode}`, 'use overwrite, append, replace or lines');
+    }
+
+    let text = '';
+    try {
+      const existing = await this.contents.get(path, {
+        content: true,
+        type: 'file',
+        format: 'text',
+      });
+      text = typeof existing.content === 'string' ? existing.content : '';
+    } catch {
+      text = '';
+    }
+
+    const detail: Record<string, unknown> = {};
+
+    if (mode === 'append') {
+      text = text + payload;
+    } else if (mode === 'replace') {
+      const edits = Array.isArray(args.edits)
+        ? (args.edits as Array<Record<string, unknown>>)
+        : [];
+      if (edits.length === 0) {
+        return fail(
+          'invalid_argument',
+          'replace mode needs edits',
+          'edits: [{"old_text": "...", "new_text": "...", "replace_all": false}]',
+        );
+      }
+      for (const [i, edit] of edits.entries()) {
+        const oldText = String(edit.old_text ?? '');
+        const newText = String(edit.new_text ?? '');
+        if (!oldText) {
+          return fail('invalid_argument', `edit ${i}: old_text is empty`);
+        }
+        const at = text.indexOf(oldText);
+        if (at < 0) {
+          return fail(
+            'patch_failed',
+            `edit ${i}: old_text not found in ${path}`,
+            'read the file and copy an exact excerpt (whitespace included)',
+          );
+        }
+        text =
+          edit.replace_all === true
+            ? text.split(oldText).join(newText)
+            : text.slice(0, at) + newText + text.slice(at + oldText.length);
+      }
+      detail.edits = edits.length;
+    } else {
+      const lines = text.split('\n');
+      const start = Math.max(1, Math.floor(Number(args.start_line ?? 1)) || 1);
+      const end = Math.max(start - 1, Math.floor(Number(args.end_line ?? start)) || start);
+      if (start > lines.length + 1) {
+        return fail(
+          'invalid_argument',
+          `start_line ${start} is past the end (${lines.length} lines)`,
+        );
+      }
+      lines.splice(start - 1, Math.max(0, end - start + 1), ...payload.split('\n'));
+      text = lines.join('\n');
+      detail.start_line = start;
+      detail.end_line = end;
+    }
+
     await this.ensureParent(path);
-    await this.contents.save(path, {
-      type: 'file',
-      format: 'text',
-      content: String(args.content ?? ''),
+    await this.contents.save(path, { type: 'file', format: 'text', content: text });
+    return ok(`wrote ${path} (${mode})`, {
+      path,
+      mode,
+      chars: text.length,
+      lines: text.split('\n').length,
+      ...detail,
     });
-    return ok(`wrote ${path}`, { path });
+  }
+
+  private async fileStat(args: Record<string, unknown>): Promise<JobResult> {
+    const path = String(args.path ?? '');
+    if (!path) {
+      return fail('invalid_argument', 'missing path', 'pass the file path, e.g. "weights.npy"');
+    }
+    const model = await this.contents.get(path, { content: false });
+    const info: Record<string, unknown> = {
+      path,
+      type: model.type,
+      size: model.size ?? null,
+      format: model.format ?? null,
+      created: model.created ?? null,
+      last_modified: model.last_modified ?? null,
+    };
+
+    if (/\.npy$/i.test(path)) {
+      const npy = await this.npyHeader(path);
+      if (npy) {
+        info.npy = npy;
+      }
+    } else if (/\.npz$/i.test(path)) {
+      info.npz = { note: 'zip archive; load with numpy.load in the kernel' };
+    } else if (/\.ipynb$/i.test(path) && (model.size ?? 0) < 5_000_000) {
+      try {
+        const nb = await this.contents.get(path, { content: true, type: 'notebook', format: 'json' });
+        const cells = (nb.content as { cells?: unknown[] } | null)?.cells;
+        info.notebook = { cells: Array.isArray(cells) ? cells.length : null };
+      } catch {
+        // metadata only
+      }
+    }
+
+    return ok(JSON.stringify(info, null, 2), { stat: info });
+  }
+
+  private async npyHeader(path: string): Promise<Record<string, unknown> | null> {
+    try {
+      const model = await this.contents.get(path, {
+        content: true,
+        type: 'file',
+        format: 'base64',
+      });
+      const b64 = typeof model.content === 'string' ? model.content : '';
+      return parseNpyHead(atob(b64.slice(0, 8192)));
+    } catch {
+      return null;
+    }
+  }
+
+  private async fileDelete(args: Record<string, unknown>): Promise<JobResult> {
+    const path = String(args.path ?? '');
+    if (!path) {
+      return fail('invalid_argument', 'missing path');
+    }
+    const model = await this.contents.get(path, { content: true });
+    const children = Array.isArray(model.content) ? (model.content as Contents.IModel[]) : [];
+    if (model.type === 'directory' && children.length > 0 && args.recursive !== true) {
+      return fail(
+        'not_empty',
+        `directory not empty: ${path}`,
+        'pass recursive:true to delete it and its contents',
+      );
+    }
+    await this.deleteRecursive(path);
+    return ok(`deleted ${path}`, { path, deleted: true });
+  }
+
+  private async deleteRecursive(path: string): Promise<void> {
+    const model = await this.contents.get(path, { content: true });
+    if (model.type === 'directory' && Array.isArray(model.content)) {
+      for (const child of model.content as Contents.IModel[]) {
+        await this.deleteRecursive(child.path);
+      }
+    }
+    await this.contents.delete(path);
+  }
+
+  private async fileMove(args: Record<string, unknown>): Promise<JobResult> {
+    const from = String(args.from ?? args.path ?? '');
+    const to = String(args.to ?? args.new_path ?? '');
+    if (!from || !to) {
+      return fail('invalid_argument', 'missing from/to', 'pass {"from": "a.txt", "to": "b.txt"}');
+    }
+    if (from === to) {
+      return ok('source and destination are the same', { from, to });
+    }
+    if (await this.exists(to)) {
+      return fail('already_exists', `destination exists: ${to}`, 'delete it first or pick another name');
+    }
+    await this.ensureParent(to);
+    try {
+      await this.docManager.rename(from, to);
+    } catch {
+      await this.contents.rename(from, to);
+    }
+    return ok(`moved ${from} -> ${to}`, { from, to });
+  }
+
+  private async fileMkdir(args: Record<string, unknown>): Promise<JobResult> {
+    const path = String(args.path ?? '');
+    if (!path) {
+      return fail('invalid_argument', 'missing path');
+    }
+    if (await this.exists(path)) {
+      return ok(`${path} already exists`, { path, created: false });
+    }
+    await this.ensureParent(path);
+    await this.contents.save(path, { type: 'directory' });
+    return ok(`created ${path}`, { path, created: true });
   }
 
   // ── helpers ─────────────────────────────────────────────────────
@@ -796,6 +1057,28 @@ export class ToolDispatcher {
     }
   }
 
+  private async saveAttachment(
+    panel: NotebookPanel,
+    cellId: string,
+    name: string,
+    text: string,
+  ): Promise<string | null> {
+    const stem = (panel.context.path.split('/').pop() ?? 'notebook').replace(/\.ipynb$/, '');
+    const path = `_mcp/${stem}/${cellId}-${name}`;
+    try {
+      await this.ensureParent(path);
+      await this.contents.save(path, {
+        type: 'file',
+        format: 'text',
+        content: text.slice(0, MAX_ATTACHMENT),
+      });
+      return path;
+    } catch (err) {
+      console.warn('mcp-hub: could not save output attachment', path, err);
+      return null;
+    }
+  }
+
   private async saveImages(
     panel: NotebookPanel,
     cellId: string,
@@ -849,6 +1132,40 @@ function clip(text: string, max: number): string {
     return text;
   }
   return `${text.slice(0, max)}\n…[truncated ${text.length - max} chars]`;
+}
+
+function parseNpyHead(head: string): Record<string, unknown> | null {
+  try {
+    if (head.charCodeAt(0) !== 0x93 || head.slice(1, 6) !== 'NUMPY') {
+      return null;
+    }
+    const major = head.charCodeAt(6);
+    let offset = 8;
+    let len = 0;
+    if (major === 1) {
+      len = head.charCodeAt(8) | (head.charCodeAt(9) << 8);
+      offset = 10;
+    } else {
+      len =
+        head.charCodeAt(8) |
+        (head.charCodeAt(9) << 8) |
+        (head.charCodeAt(10) << 16) |
+        (head.charCodeAt(11) << 24);
+      offset = 12;
+    }
+    const header = head.slice(offset, offset + len);
+    const dtype = /'descr':\s*'([^']+)'/.exec(header)?.[1] ?? null;
+    const fortran = /'fortran_order':\s*(True|False)/.exec(header)?.[1] === 'True';
+    const shapeRaw = /'shape':\s*\(([^)]*)\)/.exec(header)?.[1] ?? '';
+    const shape = shapeRaw
+      .split(',')
+      .map(part => part.trim())
+      .filter(Boolean)
+      .map(Number);
+    return { dtype, shape, fortran_order: fortran, header_bytes: len };
+  } catch {
+    return null;
+  }
 }
 
 function fmtRange(range: unknown): string {

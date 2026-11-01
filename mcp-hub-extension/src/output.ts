@@ -11,6 +11,8 @@ export interface CollectedImage {
 
 export interface CollectedOutputs {
   content: Content[];
+  /** Full text output, before any inline truncation. */
+  text: string;
   raw: unknown[];
   images: CollectedImage[];
   hasError: boolean;
@@ -28,7 +30,7 @@ export async function collectOutputs(
   maxText = 12_000,
 ): Promise<CollectedOutputs> {
   if (cell.model.type !== 'code') {
-    return { content: [], raw: [], images: [], hasError: false };
+    return { content: [], text: '', raw: [], images: [], hasError: false };
   }
 
   const model = cell.model as ICodeCellModel;
@@ -83,7 +85,8 @@ export async function collectOutputs(
     }
   }
 
-  const text = truncate(textParts.join('\n').trim(), maxText);
+  const fullText = textParts.join('\n').trim();
+  const text = truncate(fullText, maxText);
   const content: Content[] = [];
   if (text) {
     content.push({ type: 'text', text });
@@ -102,6 +105,7 @@ export async function collectOutputs(
   }
   return {
     content,
+    text: fullText,
     raw: sanitizeOutputs(raw),
     images: collectedImages,
     hasError,
@@ -110,13 +114,16 @@ export async function collectOutputs(
 }
 
 /**
- * Strip base64 payloads so `structuredContent` stays readable. Image entries
- * become explicit pointers, never silent placeholders.
+ * Keep `structuredContent` readable: long text keeps its head plus an explicit
+ * marker, and image payloads become pointers to the image content block.
  */
-export function sanitizeOutputs(raw: unknown[]): unknown[] {
+export function sanitizeOutputs(raw: unknown[], maxString = 4_000): unknown[] {
   const walk = (value: unknown): unknown => {
     if (typeof value === 'string') {
-      return value.length > 512 ? `<${value.length} chars>` : value;
+      if (value.length <= maxString) {
+        return value;
+      }
+      return `${value.slice(0, maxString)}\n…[${value.length - maxString} chars omitted; fetch the saved output with file_read offset]`;
     }
     if (Array.isArray(value)) {
       return value.map(walk);

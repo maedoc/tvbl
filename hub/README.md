@@ -110,7 +110,16 @@ Errors never carry `job_id` or `status`, so a client only has to look at
 
 Mutating tools accept an optional `idempotency_key`; a retry with the same key
 within 10 minutes returns the original job instead of executing again (the DO
-stores `idem:<kind>:<key> -> job id`).
+stores `idem:<kind>:<key> -> job id`). Every tool also accepts an optional
+`_confirmationReason` (clients that attach one to write tools can do so
+uniformly; it is ignored).
+
+Large stdout is written to `_mcp/<notebook>/<cell>-stdout.txt` and paged with
+`file_read` (`offset` + `next_offset`). `file_stat` parses `.npy` headers
+(dtype/shape/order) without the kernel, `file_read` returns base64 for known
+binary extensions or `encoding:"base64"`, and the file API includes
+`file_mkdir`, `file_move`, `file_delete` and `file_write` modes
+(overwrite/append/replace/lines).
 
 ## Async and job handles
 

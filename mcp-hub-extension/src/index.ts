@@ -1,5 +1,6 @@
 import type { JupyterFrontEnd, JupyterFrontEndPlugin } from '@jupyterlab/application';
 import { ICommandPalette, ISessionContextDialogs } from '@jupyterlab/apputils';
+import { PageConfig } from '@jupyterlab/coreutils';
 import { IDocumentManager } from '@jupyterlab/docmanager';
 import { INotebookTracker } from '@jupyterlab/notebook';
 import { ISettingRegistry } from '@jupyterlab/settingregistry';
@@ -221,8 +222,17 @@ function readSettings(settings: ISettingRegistry.ISettings): HubSettings {
     const value = get(key);
     return typeof value === 'boolean' ? value : fallback;
   };
+  // A settings override wins; otherwise allow the site to point the plugin at a
+  // local hub with jupyter-config-data/mcpHubUrl (the schema default would
+  // otherwise mask it).
+  const hubUser = settings.get('hubUrl')?.user;
+  const hubUrl =
+    typeof hubUser === 'string' && hubUser
+      ? hubUser
+      : PageConfig.getOption('mcpHubUrl') || DEFAULT_HUB;
+
   return {
-    hubUrl: str('hubUrl', DEFAULT_HUB).replace(/\/+$/, ''),
+    hubUrl: hubUrl.replace(/\/+$/, ''),
     pairId: str('pairId'),
     pairToken: str('pairToken'),
     autoConnect: bool('autoConnect', true),

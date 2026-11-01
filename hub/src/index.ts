@@ -24,6 +24,7 @@ const INSTRUCTIONS = [
   "Before editing or running an existing cell, call notebook_read for the full cell list (stable cell ids; indices shift).",
   "Images arrive as MCP image blocks; if you cannot see them, call notebook_figures for a text summary of the matplotlib axes.",
   "Write calls accept an optional idempotency_key: retrying the same key within 10 minutes does not execute twice.",
+  "Large stdout is saved under _mcp/<notebook>/ and can be paged with file_read offset; file_stat reports .npy shape/dtype; file_write supports overwrite/append/replace/lines.",
 ].join(" ");
 
 const OFFLINE_TEXT =
@@ -86,7 +87,7 @@ async function handleMcp(request: Request, env: Env, pairId: string): Promise<Re
   const inline = Number(env.INLINE_WAIT_MS ?? "");
   const runWait = Number.isFinite(inline) && inline >= 0 ? Math.floor(inline) : RUN_WAIT_MS;
   const server = new McpServer(
-    { name: "tvbl-mcp-hub", version: "0.3.0", title: "TVBL JupyterLite notebook" },
+    { name: "tvbl-mcp-hub", version: "0.4.0", title: "TVBL JupyterLite notebook" },
     {
       instructions: INSTRUCTIONS,
       jsonSchemaValidator: new CfWorkerJsonSchemaValidator(),
@@ -128,6 +129,16 @@ interface ToolSpec {
   idempotent?: boolean;
   local?: "status" | "job" | "cancel";
 }
+
+const COMMON = {
+  _confirmationReason: z
+    .string()
+    .max(500)
+    .optional()
+    .describe(
+      "Optional. Some clients attach a confirmation reason to write tools; it is accepted uniformly and ignored.",
+    ),
+};
 
 const IDEM = {
   idempotency_key: z
@@ -183,7 +194,14 @@ const SPECS: ToolSpec[] = [
         .min(500)
         .max(60_000)
         .optional()
-        .describe("Total output cap per cell, default 12000."),
+        .describe("Total output text cap, default 8000."),
+      max_images: z
+        .number()
+        .int()
+        .min(0)
+        .max(8)
+        .optional()
+        .describe("How many stored figure outputs to attach (default 4)."),
     },
     annotations: { readOnlyHint: true, idempotentHint: true },
     kind: "notebook_read",
@@ -355,6 +373,16 @@ const SPECS: ToolSpec[] = [
     shape: {
       path: z.string(),
       max_chars: z.number().int().min(100).max(200_000).optional().describe("Default 20000."),
+      offset: z
+        .number()
+        .int()
+        .min(0)
+        .optional()
+        .describe("Character offset for paging through large files; the result includes next_offset."),
+      encoding: z
+        .enum(["auto", "text", "base64"])
+        .optional()
+        .describe("auto (default) picks base64 for known binary extensions; force it for other binaries."),
     },
     annotations: { readOnlyHint: true, idempotentHint: true },
     kind: "file_read",
@@ -362,10 +390,80 @@ const SPECS: ToolSpec[] = [
   {
     name: "file_write",
     title: "Write file",
-    description: "Use this to create or overwrite a text file in the runner's workspace.",
-    shape: { path: z.string(), content: z.string(), ...IDEM },
-    annotations: { destructiveHint: true },
+    description:
+      "Use this to create or edit a text file. mode='overwrite' (default) replaces it; 'append' adds to the end; 'replace' applies edits:[{old_text,new_text,replace_all?}]; 'lines' replaces start_line..end_line with content (end_line = start_line-1 inserts before start_line). No read-modify-write round trips.",
+    shape: {
+      path: z.string(),
+      content: z
+        .string()
+        .optional()
+        .describe("New content; replacement text for replace/lines modes."),
+      mode: z
+        .enum(["overwrite", "append", "replace", "lines"])
+        .optional()
+        .describe("Default overwrite."),
+      edits: z
+        .array(
+          z.object({
+            old_text: z.string(),
+            new_text: z.string(),
+            replace_all: z.boolean().optional(),
+          }),
+        )
+        .optional()
+        .describe("For mode='replace'."),
+      start_line: z.number().int().min(1).optional().describe("For mode='lines' (1-based)."),
+      end_line: z
+        .number()
+        .int()
+        .min(0)
+        .optional()
+        .describe("For mode='lines', inclusive; end_line = start_line-1 inserts before start_line."),
+      ...IDEM,
+    },
+    annotations: { destructiveHint: true, idempotentHint: true },
     kind: "file_write",
+    idempotent: true,
+  },
+  {
+    name: "file_stat",
+    title: "File metadata",
+    description:
+      "Use this before reading a data file: returns type, size, format, and for .npy the dtype/shape/fortran_order (parsed from the header), for .ipynb the cell count.",
+    shape: { path: z.string() },
+    annotations: { readOnlyHint: true, idempotentHint: true },
+    kind: "file_stat",
+  },
+  {
+    name: "file_delete",
+    title: "Delete file",
+    description:
+      "Use this to remove a file or directory. Directories must be empty unless recursive=true.",
+    shape: {
+      path: z.string(),
+      recursive: z.boolean().optional().describe("Delete directory contents too."),
+      ...IDEM,
+    },
+    annotations: { destructiveHint: true },
+    kind: "file_delete",
+    idempotent: true,
+  },
+  {
+    name: "file_move",
+    title: "Move or rename",
+    description: "Use this to move or rename a file or directory.",
+    shape: { from: z.string(), to: z.string(), ...IDEM },
+    annotations: { destructiveHint: true, idempotentHint: true },
+    kind: "file_move",
+    idempotent: true,
+  },
+  {
+    name: "file_mkdir",
+    title: "Create directory",
+    description: "Use this to create a directory (idempotent, like mkdir -p).",
+    shape: { path: z.string(), ...IDEM },
+    annotations: { idempotentHint: true },
+    kind: "file_mkdir",
     idempotent: true,
   },
 ];
@@ -377,7 +475,7 @@ function registerTools(server: McpServer, env: Env, pairId: string, runWait: num
       {
         title: spec.title,
         description: spec.description,
-        inputSchema: spec.shape,
+        inputSchema: { ...COMMON, ...spec.shape },
         annotations: spec.annotations,
       },
       async (args: Record<string, unknown>): Promise<CallToolResult> => {
@@ -391,7 +489,8 @@ function registerTools(server: McpServer, env: Env, pairId: string, runWait: num
           );
         }
         if (spec.local === "cancel") return jobCancel(env, pairId, String(args.job_id ?? ""));
-        const { idempotency_key, wait_ms, ...forward } = args;
+        const { idempotency_key, wait_ms, _confirmationReason, ...forward } = args;
+        void _confirmationReason;
         const fallback =
           spec.kind === "cell_run" || spec.kind === "notebook_run_all"
             ? runWait
