@@ -1,0 +1,17 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "@tvbl/jupyterlite-mcp-hub"
+version = "0.1.0"
+description = "Connect a JupyterLite notebook to an MCP hub (browser runner side)"
+requires-python = ">=3.9"
+dependencies = ["jupyterlab>=4"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+[tool.jupyterlab]
+extension-dir = "../extensions/@tvbl/jupyterlite-mcp-hub"
+schema-dir = "schema"

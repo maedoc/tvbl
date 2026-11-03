@@ -61,7 +61,7 @@ export class HubClient {
         JSON.stringify({
           type: 'auth',
           token: this.cfg.pairToken,
-          label: `JupyterLite · ${navigator.userAgent.includes('Firefox') ? 'Firefox' : 'browser'}`,
+          label: `${document.title.replace(/\s*\u00b7\s*Jupyter(Lite|Lab).*$/, '') || 'browser tab'}`,
         }),
       );
     };
