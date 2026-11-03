@@ -22,6 +22,7 @@ requirements:
     - cython
     - numpy
     - pip
+    - certifi
   host:
     - python
     - numpy
