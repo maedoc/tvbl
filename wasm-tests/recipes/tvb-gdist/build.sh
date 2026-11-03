@@ -2,6 +2,9 @@
 set -euxo pipefail
 
 export LDFLAGS="-s MODULARIZE=1 -s LINKABLE=1 -s EXPORT_ALL=1 -s WASM=1 -s SIDE_MODULE=1 -s WASM_BIGINT -s ALLOW_MEMORY_GROWTH=1"
-export PIP_CERT="$(${PYTHON} -c 'import certifi; print(certifi.where())')"
-export SSL_CERT_FILE="$PIP_CERT"
+# pip builds an SSL session eagerly and calls load_verify_locations(certifi.where());
+# the emscripten build prefix ships no CA bundle, so materialize one at that path.
+CERTIFI_CACERT="$(${PYTHON} -c 'import certifi; print(certifi.where())')"
+mkdir -p "$(dirname "$CERTIFI_CACERT")"
+cp /etc/ssl/certs/ca-certificates.crt "$CERTIFI_CACERT"
 ${PYTHON} -m pip install . -vv --no-deps --no-build-isolation --no-index
